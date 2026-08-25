@@ -27,7 +27,10 @@ BULLISH_SNIPPETS = [
 
 def _detector_with_stubbed_news(monkeypatch, snippets, **kwargs):
     detector = EventDetector(watchlist=[], macro_events=[JACKSON_HOLE_EVENT], **kwargs)
-    monkeypatch.setattr(detector, "_search_news", lambda query, max_results=None: snippets)
+    monkeypatch.setattr(
+        detector, "_search_news",
+        lambda query, max_results=None, topic=None, time_range=None: snippets,
+    )
     return detector
 
 
@@ -78,7 +81,10 @@ def test_macro_event_outside_lookahead_window_is_not_detected(monkeypatch):
 def test_unscheduled_macro_event_is_skipped(monkeypatch):
     unscheduled = {**JACKSON_HOLE_EVENT, "date": None, "event_type": "macro_fomc"}
     detector = EventDetector(watchlist=[], macro_events=[unscheduled])
-    monkeypatch.setattr(detector, "_search_news", lambda query, max_results=None: BULLISH_SNIPPETS)
+    monkeypatch.setattr(
+        detector, "_search_news",
+        lambda query, max_results=None, topic=None, time_range=None: BULLISH_SNIPPETS,
+    )
 
     events = detector.check_macro_events(now=datetime(2026, 8, 25, tzinfo=timezone.utc))
 
@@ -99,7 +105,7 @@ def test_search_news_without_tavily_key_returns_empty_list():
     ],
 )
 def test_score_sentiment_direction(snippets, expect_sign):
-    score, confidence = score_sentiment(snippets)
+    score, confidence = score_sentiment(snippets, domain="earnings")
     assert -1.0 <= score <= 1.0
     assert 0.0 <= confidence <= 1.0
     if expect_sign > 0:
@@ -109,3 +115,84 @@ def test_score_sentiment_direction(snippets, expect_sign):
     else:
         assert score == 0.0
         assert confidence == 0.0
+
+
+# -- word-boundary matching -------------------------------------------------
+
+def test_word_boundary_prevents_transmission_false_positive():
+    # "miss" must not match inside "transmission" — this was the live bug
+    # found scoring real Jackson Hole coverage (Fed's "transmission of
+    # monetary policy" language triggered false negative hits).
+    snippets = ["The committee discussed the transmission of monetary policy this week."]
+    score, confidence = score_sentiment(snippets, domain="macro")
+    assert score == 0.0
+    assert confidence == 0.0
+
+
+def test_word_boundary_still_matches_standalone_miss():
+    # The fix must not overcorrect — a real standalone "miss" should still count.
+    snippets = ["The company reported a miss versus analyst expectations."]
+    score, _ = score_sentiment(snippets, domain="earnings")
+    assert score < 0
+
+
+# -- domain-lexicon routing --------------------------------------------------
+
+def test_domain_lexicon_flips_polarity_for_shared_keyword():
+    # Same text, opposite sign depending on domain: weak earnings are
+    # bearish for a stock; weak macro/jobs data is dovish (rate-cut odds
+    # rise) and so bullish for risk assets.
+    weak_text = ["Guidance came in weak for the quarter."]
+
+    earnings_score, _ = score_sentiment(weak_text, domain="earnings")
+    macro_score, _ = score_sentiment(weak_text, domain="macro")
+
+    assert earnings_score < 0
+    assert macro_score > 0
+
+
+def test_domain_lexicon_flips_polarity_for_strong_keyword():
+    strong_text = ["The report came in strong across the board."]
+
+    earnings_score, _ = score_sentiment(strong_text, domain="earnings")
+    macro_score, _ = score_sentiment(strong_text, domain="macro")
+
+    assert earnings_score > 0
+    assert macro_score < 0
+
+
+# -- duplicate-snippet deduplication -----------------------------------------
+
+def test_duplicate_snippets_yield_lower_confidence_than_distinct_ones():
+    # Same underlying fact restated three ways should count as ~1
+    # corroborating source, not three — so confidence should land lower
+    # than three genuinely distinct positive signals.
+    duplicate_snippets = [
+        "Nvidia beat earnings estimates by 6 percent this quarter",
+        "Nvidia beat earnings estimates by 6 percent this quarter, results show",
+        "Nvidia beat earnings estimates by 6 percent this quarter, per the filing",
+    ]
+    distinct_snippets = [
+        "Nvidia beat earnings estimates this quarter",
+        "Analysts upgraded Nvidia stock following strong guidance",
+        "Nvidia shares rally as the growth outlook improves",
+    ]
+
+    _, duplicate_confidence = score_sentiment(duplicate_snippets, domain="earnings")
+    _, distinct_confidence = score_sentiment(distinct_snippets, domain="earnings")
+
+    assert duplicate_confidence < distinct_confidence
+
+
+def test_dedupe_snippets_collapses_near_identical_text():
+    from agent.event_detector import _dedupe_snippets
+
+    snippets = [
+        "Nvidia beat earnings estimates by 6 percent this quarter",
+        "Nvidia beat earnings estimates by 6 percent this quarter, results show",
+        "Completely unrelated sentence about a different topic entirely",
+    ]
+
+    deduped = _dedupe_snippets(snippets)
+
+    assert len(deduped) == 2

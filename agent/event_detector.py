@@ -23,9 +23,11 @@ import argparse
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from difflib import SequenceMatcher
 from typing import Optional
 
 try:
@@ -96,37 +98,164 @@ class Event:
 
 # ---------------------------------------------------------------------------
 # Sentiment heuristic
+#
+# Two domain-specific lexicons, not one shared list: the same word can mean
+# opposite things for a company's earnings vs. macro/Fed commentary. "weak"
+# earnings are bearish for the stock; "weak" jobs data is typically dovish
+# (more likely to bring rate cuts) and so bullish for risk assets. Route each
+# event through the lexicon matching its event_type via score_sentiment(...,
+# domain=...).
 
-_POSITIVE_TERMS = [
-    "beat", "beats", "beating", "surge", "surges", "rally", "rallies",
-    "bullish", "strong", "upgrade", "upgraded", "optimistic", "growth",
-    "soar", "soars", "outperform", "dovish", "rate cut", "easing",
-    "record high", "better-than-expected",
+EARNINGS_LEXICON = {
+    "positive": [
+        "beat", "beats", "beating", "surge", "surges", "rally", "rallies",
+        "bullish", "strong", "upgrade", "upgraded", "optimistic", "growth",
+        "soar", "soars", "outperform", "record high", "better-than-expected",
+        "raises guidance", "raised guidance",
+    ],
+    "negative": [
+        "miss", "misses", "missed", "plunge", "plunges", "selloff", "sell-off",
+        "bearish", "weak", "weaker", "downgrade", "downgraded", "recession",
+        "layoff", "layoffs", "warns", "warning", "worse-than-expected",
+        "cuts guidance", "lowered guidance",
+    ],
+}
+
+# Positive = dovish / bullish for risk assets. Negative = hawkish / bearish.
+# Note "weak"/"strong" are intentionally inverted vs EARNINGS_LEXICON: weak
+# jobs/economic data raises rate-cut odds (bullish for risk), while a strong
+# labor market/economy raises hike-or-hold odds (bearish for risk).
+MACRO_LEXICON = {
+    "positive": [
+        "rate cut", "rate cuts", "cuts rates", "cutting rates", "dovish",
+        "easing", "ease policy", "pause hikes", "paused rate hikes",
+        "weak jobs", "weaker jobs", "soft labor market", "cooling labor market",
+        "cooling inflation", "disinflation", "inflation cooling",
+        "weak", "weaker",
+    ],
+    "negative": [
+        "rate hike", "rate hikes", "hikes rates", "hiking rates", "hawkish",
+        "tightening", "sticky inflation", "inflation surge", "strong jobs",
+        "strong labor market", "resilient inflation", "higher for longer",
+        "tight labor market", "strong", "stronger",
+    ],
+}
+
+_LEXICONS = {"earnings": EARNINGS_LEXICON, "macro": MACRO_LEXICON}
+
+
+def _compile_terms(terms: list[str]) -> re.Pattern:
+    # Longest-first so multi-word phrases match before their shorter substrings.
+    ordered = sorted(terms, key=len, reverse=True)
+    return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in ordered) + r")\b")
+
+
+_COMPILED = {
+    domain: {
+        "positive": _compile_terms(lex["positive"]),
+        "negative": _compile_terms(lex["negative"]),
+    }
+    for domain, lex in _LEXICONS.items()
+}
+
+# Citation/footnote noise: academic references, footnote markers, and
+# "sponsored by"/"presented at" framing read as live signal to a keyword
+# scanner but are historical citations, not current reporting.
+_CITATION_PATTERNS = [
+    re.compile(r"presented at"),
+    re.compile(r"sponsored by"),
+    re.compile(r"see also"),
+    re.compile(r"op\.\s*cit\."),
+    re.compile(r"return to text"),
+    re.compile(r"\(\d{4}\)[\.,]?\s*[\"“‘]"),  # (2019). "Title..."
+    re.compile(r"^\s*\d+\.\s+see\b"),  # footnote marker, e.g. "6. See ..."
 ]
-_NEGATIVE_TERMS = [
-    "miss", "misses", "missed", "plunge", "plunges", "selloff", "sell-off",
-    "bearish", "weak", "downgrade", "downgraded", "recession", "hawkish",
-    "rate hike", "layoff", "layoffs", "warns", "warning", "inflation surge",
-    "worse-than-expected", "cuts guidance",
-]
+_CITATION_DOWNWEIGHT = 0.25
+
+# Snippets are treated as near-duplicate (same underlying fact restated) above
+# this similarity ratio, and only the first occurrence counts toward confidence.
+_DEDUP_SIMILARITY_THRESHOLD = 0.6
 
 
-def score_sentiment(snippets: list[str]) -> tuple[float, float]:
-    """Crude keyword-count heuristic over search-result snippets.
+def _is_citation_noise(snippet: str) -> bool:
+    lowered = snippet.lower()
+    return any(p.search(lowered) for p in _CITATION_PATTERNS)
+
+
+def _normalize_for_dedup(snippet: str) -> str:
+    return re.sub(r"\s+", " ", snippet.lower()).strip()
+
+
+def _dedupe_snippets(snippets: list[str]) -> list[str]:
+    """Drop snippets that are near-identical restatements of an earlier one."""
+    kept: list[str] = []
+    kept_normalized: list[str] = []
+    for snippet in snippets:
+        normalized = _normalize_for_dedup(snippet)
+        if any(
+            SequenceMatcher(None, normalized, existing).ratio() >= _DEDUP_SIMILARITY_THRESHOLD
+            for existing in kept_normalized
+        ):
+            continue
+        kept.append(snippet)
+        kept_normalized.append(normalized)
+    return kept
+
+
+def score_sentiment(snippets: list[str], domain: str = "earnings") -> tuple[float, float]:
+    """Domain-aware keyword-count heuristic over search-result snippets.
+
+    Deduplicates near-identical snippets first (one fact restated across
+    sources shouldn't count as multiple corroborating signals), then scores
+    with word-boundary matching against the lexicon for `domain`
+    ("earnings" or "macro") so the same word can carry different polarity
+    in each context. Citation/footnote-like snippets are downweighted
+    rather than treated as live reporting.
 
     Returns (sentiment_score in [-1, 1], confidence in [0, 1]).
+    confidence reflects agreement across independent, non-duplicate,
+    non-citation sources — not raw keyword hit count.
     """
     if not snippets:
         return 0.0, 0.0
 
-    text = " ".join(snippets).lower()
-    pos_hits = sum(text.count(term) for term in _POSITIVE_TERMS)
-    neg_hits = sum(text.count(term) for term in _NEGATIVE_TERMS)
-    total_hits = pos_hits + neg_hits
+    lexicon = _COMPILED.get(domain, _COMPILED["earnings"])
+    deduped = _dedupe_snippets(snippets)
 
-    score = 0.0 if total_hits == 0 else (pos_hits - neg_hits) / total_hits
-    # More snippets and more keyword hits -> higher confidence, capped at 1.0.
-    confidence = min(1.0, 0.15 * len(snippets) + 0.1 * total_hits)
+    total_pos = 0.0
+    total_neg = 0.0
+    leaning_weights = []  # (weight, sign) for snippets with any hit
+
+    for snippet in deduped:
+        text = snippet.lower()
+        weight = _CITATION_DOWNWEIGHT if _is_citation_noise(snippet) else 1.0
+
+        pos_hits = len(lexicon["positive"].findall(text))
+        neg_hits = len(lexicon["negative"].findall(text))
+
+        total_pos += pos_hits * weight
+        total_neg += neg_hits * weight
+
+        net = pos_hits - neg_hits
+        if net != 0:
+            leaning_weights.append((weight, 1 if net > 0 else -1))
+
+    total_hits = total_pos + total_neg
+    if total_hits == 0:
+        return 0.0, 0.0
+
+    score = (total_pos - total_neg) / total_hits
+    majority_sign = 0 if total_pos == total_neg else (1 if total_pos > total_neg else -1)
+
+    if majority_sign == 0 or not leaning_weights:
+        # No clear directional consensus — cap confidence low regardless of volume.
+        confidence = min(1.0, 0.1 * sum(w for w, _ in leaning_weights))
+    else:
+        total_weight = sum(w for w, _ in leaning_weights)
+        agreeing_weight = sum(w for w, sign in leaning_weights if sign == majority_sign)
+        agreement_ratio = agreeing_weight / total_weight
+        volume_factor = min(1.0, total_weight / 3.0)
+        confidence = agreement_ratio * volume_factor
 
     return round(score, 3), round(confidence, 3)
 
@@ -165,14 +294,23 @@ class EventDetector:
 
     # -- news/sentiment ----------------------------------------------------
 
-    def _search_news(self, query: str, max_results: Optional[int] = None) -> list[str]:
+    def _search_news(
+        self,
+        query: str,
+        max_results: Optional[int] = None,
+        topic: Optional[str] = None,
+        time_range: Optional[str] = None,
+    ) -> list[str]:
         """Single seam for hitting Tavily. Tests monkeypatch this directly."""
         if self._tavily_client is None:
             logger.warning("Skipping news search (no Tavily client configured) for query=%r", query)
             return []
         try:
             response = self._tavily_client.search(
-                query=query, max_results=max_results or self.news_max_results
+                query=query,
+                max_results=max_results or self.news_max_results,
+                topic=topic,
+                time_range=time_range,
             )
             results = response.get("results", []) if isinstance(response, dict) else []
             return [r.get("content", "") for r in results if r.get("content")]
@@ -219,11 +357,20 @@ class EventDetector:
     ) -> Event:
         if event_type == "earnings_surprise":
             description = f"{ticker} reported earnings on {edate.isoformat()} (surprise: {surprise_pct}%)"
+            # Just reported — bias toward reaction coverage, recent only.
+            snippets = self._search_news(
+                f"{ticker} earnings results reaction", topic="news", time_range="week"
+            )
         else:
             description = f"{ticker} has upcoming earnings on {edate.isoformat()}"
+            # Not yet reported — bias toward forward-looking preview/estimate
+            # coverage rather than reaction to the *previous* print.
+            snippets = self._search_news(
+                f"{ticker} earnings preview analyst estimates ahead of earnings",
+                topic="news",
+            )
 
-        snippets = self._search_news(f"{ticker} earnings")
-        score, confidence = score_sentiment(snippets)
+        score, confidence = score_sentiment(snippets, domain="earnings")
 
         return Event(
             event_type=event_type,
@@ -248,8 +395,10 @@ class EventDetector:
 
             delta_days = (edate - today).days
             if -self.macro_lookback_days <= delta_days <= self.macro_lookahead_days:
-                snippets = self._search_news(macro_event["search_query"])
-                score, confidence = score_sentiment(snippets)
+                snippets = self._search_news(
+                    macro_event["search_query"], topic="news", time_range="week"
+                )
+                score, confidence = score_sentiment(snippets, domain="macro")
 
                 events.append(Event(
                     event_type=macro_event["event_type"],
