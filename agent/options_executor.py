@@ -95,7 +95,7 @@ TARGET_DTE_MIN = 3
 TARGET_DTE_MAX = 14
 STRIKE_WINDOW_PCT = 0.15  # only consider strikes within +/-15% of spot when selecting ATM
 
-MAX_TRADES_PER_DAY = 3
+MAX_TRADES_PER_DAY = 5
 POLL_INTERVAL_SECONDS = 1800
 
 # Macro events (Jackson Hole, FOMC, CPI, ...) have ticker=None in the Event

@@ -15,6 +15,11 @@ Design notes:
 - No persistent connections: `run_once()` does a single detection pass
   (used by tests and callers that want to drive the schedule
   themselves); `run()` wraps it in a sleep loop.
+- Tavily searches are cached per (ticker or macro event_type, day) in
+  `EventDetector._news_cache` — an active ticker/macro event is only
+  searched once per calendar day, not once per poll cycle. In-memory,
+  process-lifetime only; resets on restart, same tradeoff as the rest
+  of this module's "no database, for now" design.
 """
 
 from __future__ import annotations
@@ -65,7 +70,13 @@ def _append_jsonl(path: Path, record: dict) -> None:
 # ---------------------------------------------------------------------------
 # Config
 
-DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
+DEFAULT_WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "DELL", "PANW", "MDT", "MDB", "NIO",
+    "GTLB", "AVGO", "SNOW", "HPE", "NTAP", "FIVE", "AVAV", "OLLI", "PVH", "AI",
+    "CHPT", "CIEN", "CPRT", "ZS", "IOT", "GWRE", "LULU", "DOCU", "PATH", "ASAN",
+    "CPB", "CASY", "CNM", "GME", "COO", "CHWY", "AEO", "ASO", "ORCL", "ADBE",
+    "M", "RH", "KR", "AZO", "MU", "CTAS", "GIS", "COST", "JBL", "DRI", "BB", "KBH",
+]
 
 # Macro/economic event registry. `date` is a `datetime.date` or None
 # (unscheduled placeholder — fill in once the calendar is published).
@@ -297,6 +308,15 @@ class EventDetector:
         self.macro_lookback_days = macro_lookback_days
         self.news_max_results = news_max_results
 
+        # Per-(subject, day) cache in front of _search_news: a ticker or macro
+        # event already searched today is reused across poll cycles instead of
+        # re-querying Tavily every cycle (previously every cycle re-searched
+        # every currently-active ticker, which burns quota fast against a
+        # wide watchlist). In-memory only, keyed by (subject, date) — resets
+        # on restart, consistent with the no-database approach elsewhere in
+        # this module.
+        self._news_cache: dict[tuple[str, date], list[str]] = {}
+
         api_key = tavily_api_key if tavily_api_key is not None else os.getenv("TAVILY_API_KEY")
         self._tavily_client = None
         if api_key and TavilyClient is not None:
@@ -331,6 +351,30 @@ class EventDetector:
         except Exception:
             logger.exception("Tavily search failed for query=%r", query)
             return []
+
+    def _search_news_cached(
+        self,
+        query: str,
+        subject: str,
+        today: date,
+        max_results: Optional[int] = None,
+        topic: Optional[str] = None,
+        time_range: Optional[str] = None,
+    ) -> list[str]:
+        """Cached wrapper around _search_news, keyed by (subject, today).
+
+        `subject` is the ticker for earnings events or the macro event_type
+        for macro events — whatever already-searched-today reuse should be
+        scoped to. Same subject/day across multiple poll cycles returns the
+        first cycle's result instead of re-hitting Tavily.
+        """
+        cache_key = (subject, today)
+        if cache_key in self._news_cache:
+            return self._news_cache[cache_key]
+
+        result = self._search_news(query, max_results=max_results, topic=topic, time_range=time_range)
+        self._news_cache[cache_key] = result
+        return result
 
     # -- earnings ------------------------------------------------------------
 
@@ -369,19 +413,20 @@ class EventDetector:
     def _build_earnings_event(
         self, ticker: str, edate: date, event_type: str, surprise_pct, now: datetime
     ) -> Event:
+        today = now.date()
         if event_type == "earnings_surprise":
             description = f"{ticker} reported earnings on {edate.isoformat()} (surprise: {surprise_pct}%)"
             # Just reported — bias toward reaction coverage, recent only.
-            snippets = self._search_news(
-                f"{ticker} earnings results reaction", topic="news", time_range="week"
+            snippets = self._search_news_cached(
+                f"{ticker} earnings results reaction", ticker, today, topic="news", time_range="week"
             )
         else:
             description = f"{ticker} has upcoming earnings on {edate.isoformat()}"
             # Not yet reported — bias toward forward-looking preview/estimate
             # coverage rather than reaction to the *previous* print.
-            snippets = self._search_news(
+            snippets = self._search_news_cached(
                 f"{ticker} earnings preview analyst estimates ahead of earnings",
-                topic="news",
+                ticker, today, topic="news",
             )
 
         score, confidence = score_sentiment(snippets, domain="earnings")
@@ -409,8 +454,9 @@ class EventDetector:
 
             delta_days = (edate - today).days
             if -self.macro_lookback_days <= delta_days <= self.macro_lookahead_days:
-                snippets = self._search_news(
-                    macro_event["search_query"], topic="news", time_range="week"
+                snippets = self._search_news_cached(
+                    macro_event["search_query"], macro_event["event_type"], today,
+                    topic="news", time_range="week",
                 )
                 score, confidence = score_sentiment(snippets, domain="macro")
 

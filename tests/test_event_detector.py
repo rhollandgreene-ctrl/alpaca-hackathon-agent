@@ -96,6 +96,31 @@ def test_search_news_without_tavily_key_returns_empty_list():
     assert detector._search_news("anything") == []
 
 
+def test_search_news_cached_reuses_result_for_same_ticker_and_day(monkeypatch):
+    call_count = {"n": 0}
+
+    def counting_search(query, max_results=None, topic=None, time_range=None):
+        call_count["n"] += 1
+        return [f"result for {query} (#{call_count['n']})"]
+
+    detector = EventDetector(watchlist=[], macro_events=[], tavily_api_key="dummy")
+    monkeypatch.setattr(detector, "_search_news", counting_search)
+
+    today = date(2026, 8, 26)
+    first = detector._search_news_cached("NVDA earnings preview", "NVDA", today)
+    second = detector._search_news_cached("NVDA earnings preview", "NVDA", today)
+
+    assert call_count["n"] == 1  # second call within the same day reused the cache
+    assert first == second
+
+    # A later poll cycle the following day is a cache miss and searches again.
+    tomorrow = date(2026, 8, 27)
+    third = detector._search_news_cached("NVDA earnings preview", "NVDA", tomorrow)
+
+    assert call_count["n"] == 2
+    assert third != first
+
+
 @pytest.mark.parametrize(
     "snippets,expect_sign",
     [
