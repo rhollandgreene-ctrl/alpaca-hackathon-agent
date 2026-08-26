@@ -38,6 +38,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -363,19 +364,19 @@ class OptionsExecutor:
 
         spot = self._spot_price(ticker)
         if spot is None:
-            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", extra=base_extra)
+            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", dry_run=self.dry_run, extra=base_extra)
 
         contract = self.select_contract(ticker, option_type, spot, today)
         if contract is None:
             return ExecutionResult(
                 event, decision, False,
                 f"no tradable {option_type.value} contract found for {ticker} in DTE window",
-                extra=base_extra,
+                dry_run=self.dry_run, extra=base_extra,
             )
 
         ask = self._latest_option_ask(contract.symbol)
         if not ask:
-            return ExecutionResult(event, decision, False, f"no live ask quote for {contract.symbol}", extra=base_extra)
+            return ExecutionResult(event, decision, False, f"no live ask quote for {contract.symbol}", dry_run=self.dry_run, extra=base_extra)
 
         equity = self.get_equity()
         budget = self.position_budget(equity)
@@ -395,7 +396,7 @@ class OptionsExecutor:
         }
         if not sufficient:
             logger.warning(budget_message)
-            return ExecutionResult(event, decision, False, budget_message, extra=sizing_extra)
+            return ExecutionResult(event, decision, False, budget_message, dry_run=self.dry_run, extra=sizing_extra)
 
         order_request = LimitOrderRequest(
             symbol=contract.symbol,
@@ -418,7 +419,7 @@ class OptionsExecutor:
 
         order = self.trading_client.submit_order(order_request)
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), extra=sizing_extra)
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=sizing_extra)
 
     def execute_straddle(self, event: Event, decision: TradeDecision, today: date) -> ExecutionResult:
         ticker, proxy_note = self._resolve_ticker(event)
@@ -431,12 +432,12 @@ class OptionsExecutor:
                 event, decision, False,
                 f"underlying move {move_pct}% below STRADDLE_MIN_UNDERLYING_MOVE_PCT="
                 f"{STRADDLE_MIN_UNDERLYING_MOVE_PCT}% — volatility not confirmed, skipping straddle",
-                extra=move_extra,
+                dry_run=self.dry_run, extra=move_extra,
             )
 
         spot = self._spot_price(ticker)
         if spot is None:
-            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", extra=move_extra)
+            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", dry_run=self.dry_run, extra=move_extra)
 
         call_contract = self.select_contract(ticker, ContractType.CALL, spot, today)
         put_contract = self.select_contract(ticker, ContractType.PUT, spot, today)
@@ -444,13 +445,13 @@ class OptionsExecutor:
             return ExecutionResult(
                 event, decision, False,
                 f"could not find both call+put contracts for {ticker} straddle",
-                extra=move_extra,
+                dry_run=self.dry_run, extra=move_extra,
             )
 
         call_ask = self._latest_option_ask(call_contract.symbol)
         put_ask = self._latest_option_ask(put_contract.symbol)
         if not call_ask or not put_ask:
-            return ExecutionResult(event, decision, False, f"missing live ask quote for {ticker} straddle legs", extra=move_extra)
+            return ExecutionResult(event, decision, False, f"missing live ask quote for {ticker} straddle legs", dry_run=self.dry_run, extra=move_extra)
 
         combined_ask = call_ask + put_ask
         equity = self.get_equity()
@@ -472,7 +473,7 @@ class OptionsExecutor:
         }
         if not sufficient:
             logger.warning(budget_message)
-            return ExecutionResult(event, decision, False, budget_message, extra=sizing_extra)
+            return ExecutionResult(event, decision, False, budget_message, dry_run=self.dry_run, extra=sizing_extra)
 
         legs = [
             OptionLegRequest(symbol=call_contract.symbol, ratio_qty=1, side=OrderSide.BUY),
@@ -498,7 +499,7 @@ class OptionsExecutor:
 
         order = self.trading_client.submit_order(order_request)
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), extra=sizing_extra)
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=sizing_extra)
 
     def execute_event(self, event: Event, macro_events: list[dict] = MACRO_EVENTS, today: Optional[date] = None) -> ExecutionResult:
         today = today if today is not None else datetime.now(timezone.utc).date()
@@ -506,7 +507,7 @@ class OptionsExecutor:
 
         if decision.mode == TradeMode.NO_TRADE:
             logger.info("No trade for %s/%s: %s", event.event_type, event.ticker, decision.reason)
-            result = ExecutionResult(event, decision, False, decision.reason)
+            result = ExecutionResult(event, decision, False, decision.reason, dry_run=self.dry_run)
         elif decision.mode in (TradeMode.DIRECTIONAL_CALL, TradeMode.DIRECTIONAL_PUT):
             result = self.execute_directional(event, decision, today)
         else:
@@ -622,6 +623,14 @@ def _parse_args():
 
 
 def main():
+    # Force UTF-8 on stdout/stderr: reason strings contain em dashes, and
+    # Windows consoles default to cp1252, which mismatches a UTF-8-expecting
+    # terminal (Git Bash, most CI) and renders them as mangled replacement
+    # characters rather than raising — silently corrupting displayed text.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     if load_dotenv is not None:

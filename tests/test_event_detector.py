@@ -7,8 +7,10 @@ TAVILY_API_KEY is required to run them.
 
 from datetime import date, datetime, timezone
 
+import pandas as pd
 import pytest
 
+from agent import event_detector as ed_module
 from agent.event_detector import Event, EventDetector, score_sentiment
 
 JACKSON_HOLE_EVENT = {
@@ -221,3 +223,130 @@ def test_dedupe_snippets_collapses_near_identical_text():
     deduped = _dedupe_snippets(snippets)
 
     assert len(deduped) == 2
+
+
+# -- earnings-date instability (get_earnings_dates() scrapes a live Yahoo
+# HTML page and can silently drop/shift rows between polls -- reproduced
+# live during rehearsal on 2026-08-26: NVDA's earnings row vanished
+# entirely between two polls ~30 min apart, and AVAV's date shifted) ------
+
+def _make_earnings_df(edate: date, reported_eps=float("nan")):
+    idx = pd.DatetimeIndex([pd.Timestamp(edate)])
+    return pd.DataFrame(
+        {"EPS Estimate": [2.09], "Reported EPS": [reported_eps], "Surprise(%)": [float("nan")]},
+        index=idx,
+    )
+
+
+def test_disappearing_earnings_row_is_synthesized_from_calendar_with_warning(monkeypatch, caplog):
+    today = date(2026, 8, 26)
+    poll = {"n": 1}
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            if self.ticker != "NVDA":
+                return None
+            if poll["n"] == 1:
+                return _make_earnings_df(today)
+            return None  # poll 2+: row vanished entirely, as observed live
+
+        @property
+        def calendar(self):
+            return {"Earnings Date": [today]} if self.ticker == "NVDA" else {}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+
+    detector = EventDetector(watchlist=["NVDA"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+
+    now = datetime(2026, 8, 26, 21, 0, tzinfo=timezone.utc)
+
+    events_1 = detector.check_earnings(now=now)
+    assert len(events_1) == 1
+    assert events_1[0].event_type == "earnings_upcoming"
+    assert events_1[0].ticker == "NVDA"
+
+    poll["n"] = 2
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        events_2 = detector.check_earnings(now=now)
+
+    # The row vanished from get_earnings_dates(), but calendar still confirms
+    # it -- the ticker must not silently drop out of detection.
+    assert len(events_2) == 1
+    assert events_2[0].event_type == "earnings_upcoming"
+    assert events_2[0].ticker == "NVDA"
+    assert any("EARNINGS DATE INSTABILITY" in r.message for r in caplog.records)
+    assert any("synthesizing earnings_upcoming from calendar" in r.message for r in caplog.records)
+
+
+def test_changing_earnings_date_between_polls_logs_warning(monkeypatch, caplog):
+    today = date(2026, 8, 26)
+    first_date = date(2026, 9, 2)
+    second_date = date(2026, 9, 9)  # mirrors AVAV's observed shift
+    poll = {"n": 1}
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            edate = first_date if poll["n"] == 1 else second_date
+            return _make_earnings_df(edate)
+
+        @property
+        def calendar(self):
+            return {}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+
+    detector = EventDetector(watchlist=["AVAV"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+
+    now = datetime(2026, 8, 26, 21, 0, tzinfo=timezone.utc)
+
+    events_1 = detector.check_earnings(now=now)
+    assert events_1[0].description.endswith(first_date.isoformat())
+
+    poll["n"] = 2
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        events_2 = detector.check_earnings(now=now)
+
+    assert events_2[0].description.endswith(second_date.isoformat())
+    assert any(
+        "EARNINGS DATE INSTABILITY" in r.message and first_date.isoformat() in r.message and second_date.isoformat() in r.message
+        for r in caplog.records
+    )
+
+
+def test_stable_earnings_date_across_polls_logs_no_warning(monkeypatch, caplog):
+    today = date(2026, 9, 2)
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            return _make_earnings_df(today)
+
+        @property
+        def calendar(self):
+            return {}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+
+    detector = EventDetector(watchlist=["MSFT"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+
+    now = datetime(2026, 8, 26, 21, 0, tzinfo=timezone.utc)
+
+    with caplog.at_level("WARNING"):
+        detector.check_earnings(now=now)
+        caplog.clear()
+        detector.check_earnings(now=now)
+
+    assert not any("EARNINGS DATE INSTABILITY" in r.message for r in caplog.records)

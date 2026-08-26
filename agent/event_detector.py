@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
@@ -317,6 +318,19 @@ class EventDetector:
         # this module.
         self._news_cache: dict[tuple[str, date], list[str]] = {}
 
+        # Last earnings date seen per ticker from get_earnings_dates(), across
+        # polls of this same instance. get_earnings_dates() scrapes Yahoo's
+        # live earnings-calendar HTML page (yfinance's own implementation),
+        # not a stable structured API, and it can silently drop or shift a
+        # ticker's row between calls with no error — observed directly: a
+        # ticker's active earnings row vanished entirely between two polls
+        # ~30 minutes apart (never converted to earnings_surprise, just
+        # gone), and a different ticker's date shifted outright. This lets
+        # check_earnings() notice that drift instead of failing silently.
+        # See _check_earnings_date_stability. In-memory, resets on restart —
+        # same tradeoff as the rest of this module.
+        self._last_earnings_date_seen: dict[str, date] = {}
+
         api_key = tavily_api_key if tavily_api_key is not None else os.getenv("TAVILY_API_KEY")
         self._tavily_client = None
         if api_key and TavilyClient is not None:
@@ -394,21 +408,116 @@ class EventDetector:
                 logger.warning("yfinance earnings lookup failed for %s", ticker, exc_info=True)
                 continue
 
-            if edf is None or edf.empty:
-                continue
+            active_dates: list[date] = []
 
-            for idx, row in edf.iterrows():
-                edate = idx.date() if hasattr(idx, "date") else idx
-                delta_days = (edate - today).days
-                reported_eps = row.get("Reported EPS")
-                surprise_pct = row.get("Surprise(%)")
+            if edf is not None and not edf.empty:
+                for idx, row in edf.iterrows():
+                    edate = idx.date() if hasattr(idx, "date") else idx
+                    delta_days = (edate - today).days
+                    reported_eps = row.get("Reported EPS")
+                    surprise_pct = row.get("Surprise(%)")
 
-                if reported_eps is not None and _not_nan(reported_eps) and 0 <= (today - edate).days <= self.earnings_lookback_days:
-                    events.append(self._build_earnings_event(ticker, edate, "earnings_surprise", surprise_pct, now))
-                elif 0 <= delta_days <= self.earnings_lookahead_days:
-                    events.append(self._build_earnings_event(ticker, edate, "earnings_upcoming", None, now))
+                    if reported_eps is not None and _not_nan(reported_eps) and 0 <= (today - edate).days <= self.earnings_lookback_days:
+                        events.append(self._build_earnings_event(ticker, edate, "earnings_surprise", surprise_pct, now))
+                        active_dates.append(edate)
+                    elif 0 <= delta_days <= self.earnings_lookahead_days:
+                        events.append(self._build_earnings_event(ticker, edate, "earnings_upcoming", None, now))
+                        active_dates.append(edate)
+
+            synthesized_date = self._check_earnings_date_stability(ticker, today, active_dates)
+            if synthesized_date is not None:
+                # calendar confirms an imminent date but carries no Reported
+                # EPS/surprise data, so the only event we can honestly
+                # synthesize from it is earnings_upcoming.
+                events.append(self._build_earnings_event(ticker, synthesized_date, "earnings_upcoming", None, now))
 
         return events
+
+    def _check_earnings_date_stability(
+        self, ticker: str, today: date, active_dates: list[date]
+    ) -> Optional[date]:
+        """Cross-check get_earnings_dates() against the more stable `calendar`
+        endpoint and this instance's own poll history, and log loudly on any
+        mismatch instead of failing silently.
+
+        get_earnings_dates() scrapes Yahoo's live earnings-calendar HTML page
+        (see yfinance's own _get_earnings_dates_using_scrape) rather than
+        calling a stable structured API, and can silently drop or shift a
+        row between calls. `calendar` is a separate, less detailed (no
+        Reported EPS/surprise) but more stable endpoint that held steady
+        through the exact window get_earnings_dates() dropped a ticker's row
+        entirely.
+
+        Returns a calendar-confirmed date to synthesize an earnings_upcoming
+        event from, if get_earnings_dates() dropped a date that calendar
+        still confirms is imminent — otherwise None.
+        """
+        prior_date = self._last_earnings_date_seen.get(ticker)
+        current_date = active_dates[0] if active_dates else None
+
+        if prior_date is not None and current_date != prior_date:
+            if current_date is None:
+                logger.warning(
+                    "EARNINGS DATE INSTABILITY: %s had an active earnings date "
+                    "%s from get_earnings_dates() on a prior poll; it is now "
+                    "MISSING entirely from get_earnings_dates() — cross-checking "
+                    "the calendar endpoint",
+                    ticker, prior_date.isoformat(),
+                )
+            else:
+                logger.warning(
+                    "EARNINGS DATE INSTABILITY: %s active earnings date from "
+                    "get_earnings_dates() changed from %s to %s between polls",
+                    ticker, prior_date.isoformat(), current_date.isoformat(),
+                )
+
+        if current_date is not None:
+            self._last_earnings_date_seen[ticker] = current_date
+            return None
+
+        # get_earnings_dates() has no active row for this ticker this poll.
+        # Only bother cross-checking calendar (an extra network call) when we
+        # have prior-poll evidence this ticker was actually in play — avoids
+        # doubling yfinance calls for the ~48 watchlist tickers that were
+        # never active in the first place.
+        if prior_date is None:
+            return None
+
+        calendar_date = self._get_calendar_earnings_date(ticker)
+        if calendar_date is None:
+            return None
+
+        in_window = (
+            0 <= (calendar_date - today).days <= self.earnings_lookahead_days
+            or 0 <= (today - calendar_date).days <= self.earnings_lookback_days
+        )
+        if not in_window:
+            return None
+
+        logger.warning(
+            "%s: get_earnings_dates() dropped the row but calendar confirms "
+            "earnings on %s — synthesizing earnings_upcoming from calendar so "
+            "this ticker isn't silently lost from detection",
+            ticker, calendar_date.isoformat(),
+        )
+        self._last_earnings_date_seen[ticker] = calendar_date
+        return calendar_date
+
+    def _get_calendar_earnings_date(self, ticker: str) -> Optional[date]:
+        """Cross-check source for _check_earnings_date_stability — a separate
+        yfinance endpoint from get_earnings_dates(), less detailed (no
+        Reported EPS/surprise) but observed to be more stable."""
+        try:
+            calendar = yf.Ticker(ticker).calendar
+        except Exception:
+            logger.warning("yfinance calendar lookup failed for %s", ticker, exc_info=True)
+            return None
+        if not calendar:
+            return None
+        dates = calendar.get("Earnings Date")
+        if not dates:
+            return None
+        return dates[0]
 
     def _build_earnings_event(
         self, ticker: str, edate: date, event_type: str, surprise_pct, now: datetime
@@ -521,6 +630,15 @@ def _parse_args():
 
 
 def main():
+    # Force UTF-8 on stdout/stderr: descriptions/reason strings contain em
+    # dashes, and Windows consoles default to cp1252, which mismatches a
+    # UTF-8-expecting terminal (Git Bash, most CI) and renders them as
+    # mangled replacement characters rather than raising — silently
+    # corrupting displayed text.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     if load_dotenv is not None:
