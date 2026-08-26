@@ -20,7 +20,10 @@ _TBD_
 
 ## MCP Tools
 
-_TBD_
+An MCP server (`mcp_server/server.py`) exposes 8 tools for Claude to query and
+explain the system live — see [docs/mcp_tools.md](docs/mcp_tools.md) for the
+full reference, Claude Desktop setup, and a table of which tools are real
+data vs. clearly-labeled mocked/illustrative data.
 
 ## License
 

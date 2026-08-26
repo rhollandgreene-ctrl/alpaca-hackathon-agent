@@ -1,0 +1,50 @@
+[
+  {
+    "id": "word-boundary-matching",
+    "date": "2026-08-25",
+    "component": "agent/event_detector.py",
+    "title": "Word-boundary matching for sentiment keywords",
+    "summary": "score_sentiment() originally used substring counting (text.count(\"miss\")), which matched \"miss\" inside unrelated words like \"transmission\" and \"commission\". Live Jackson Hole coverage tripped this exact bug. Replaced with \\b-bounded regex matching across the whole lexicon.",
+    "impact": "Eliminated false-positive sentiment hits that were inflating both score magnitude and confidence on noise, not signal."
+  },
+  {
+    "id": "domain-aware-lexicons",
+    "date": "2026-08-25",
+    "component": "agent/event_detector.py",
+    "title": "Domain-specific sentiment lexicons (earnings vs. macro)",
+    "summary": "The same word can carry opposite market meaning depending on context: \"weak\" earnings are bearish for a stock, but \"weak\" jobs/macro data is typically dovish (raises rate-cut odds) and so bullish for risk assets. Split into EARNINGS_LEXICON and MACRO_LEXICON, routed by event_type.",
+    "impact": "Prevents a single shared keyword list from scoring macro commentary backwards."
+  },
+  {
+    "id": "consensus-based-confidence",
+    "date": "2026-08-25",
+    "component": "agent/event_detector.py",
+    "title": "Consensus-based confidence, not raw keyword-hit count",
+    "summary": "Confidence originally scaled with total keyword hits, so one fact restated across several near-duplicate search snippets looked like multiple independent confirmations. Added snippet deduplication (difflib similarity ratio) before scoring, and confidence now reflects agreement across distinct, non-duplicate sources.",
+    "impact": "A repeated single fact now yields meaningfully lower confidence than several genuinely distinct corroborating sources with the same total hit count."
+  },
+  {
+    "id": "macro-proxy-ticker",
+    "date": "2026-08-25",
+    "component": "agent/options_executor.py",
+    "title": "Macro events need a real underlying to trade options on",
+    "summary": "Macro events (Jackson Hole, FOMC, CPI) carry ticker=None in the Event schema by design -- they're not stock-specific. Feeding None straight into an Alpaca options/quote call crashed with a Pydantic validation error the first time it was exercised live. Added MACRO_PROXY_TICKER (SPY) as the resolved underlying whenever event.ticker is None.",
+    "impact": "Caught via live verification before Aug 28, not in production. Jackson Hole (and any future macro event) now trades SPY options as the broad-market proxy."
+  },
+  {
+    "id": "dte-server-side-filtering",
+    "date": "2026-08-25",
+    "component": "agent/options_executor.py",
+    "title": "Contract expiration filtering must happen server-side, not client-side",
+    "summary": "select_contract() originally queried expiration_date_gte=today and filtered the target DTE window (3-14 days) client-side after the fact. For names with dense near-term expirations (SPY lists near-daily expiries), a single 100-contract page came back entirely 0DTE strikes before ever reaching the 3-14 DTE window -- select_contract returned None even though valid contracts existed. Fixed by setting expiration_date_gte to today+TARGET_DTE_MIN directly in the API request.",
+    "impact": "Found live against the real paper account testing the SPY macro-proxy path -- would have silently produced 'no contract found' for the flagship Jackson Hole trade."
+  },
+  {
+    "id": "budget-sizing",
+    "date": "2026-08-25",
+    "component": "agent/options_executor.py",
+    "title": "Position size vs. real option premiums",
+    "summary": "Live verification showed 1% of a $100k paper account ($1,000) frequently couldn't afford a single ATM contract at real SPY/NVDA premiums, let alone both legs of a straddle -- trades were silently sized to qty=0 and skipped. Bumped POSITION_SIZE_PCT_OF_EQUITY to 1.5% and added an explicit _check_min_trade_budget gate that logs a distinct \"SKIPPED: ...\" message (not folded into a generic no-trade log) whenever a signal clears every eligibility/confidence/sentiment gate but can't be sized.",
+    "impact": "Prevents the failure mode of 'the system went quiet' being ambiguous between 'nothing qualified' and 'something qualified but couldn't be sized' -- critical for reading the system correctly live during a demo."
+  }
+]

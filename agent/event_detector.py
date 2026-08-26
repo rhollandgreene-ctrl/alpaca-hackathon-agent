@@ -28,6 +28,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -46,6 +47,19 @@ except ImportError:  # pragma: no cover - optional at import time
     yf = None
 
 logger = logging.getLogger("daedalus.event_detector")
+
+# Append-only JSONL history of every detected Event, in addition to the
+# console logging above — not a database, just a local file the MCP server
+# reads back for get_recent_signals. Gitignored; data/ itself is tracked
+# via .gitkeep.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EVENTS_LOG_PATH = REPO_ROOT / "data" / "events.jsonl"
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +433,7 @@ class EventDetector:
 
         for event in events:
             logger.info("Detected event: %s", json.dumps(event.to_dict()))
+            _append_jsonl(EVENTS_LOG_PATH, event.to_dict())
 
         if not events:
             logger.info("No events detected this cycle")

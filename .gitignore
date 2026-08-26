@@ -9,6 +9,10 @@ secrets/
 *.db
 *.sqlite3
 
+# Runtime append-only logs (event/trade history) — not committed, but the
+# directory itself is tracked via data/.gitkeep so a fresh checkout has it.
+data/*.jsonl
+
 # Logs
 *.log
 

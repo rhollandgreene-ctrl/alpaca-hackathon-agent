@@ -34,13 +34,15 @@ Design notes:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -65,6 +67,18 @@ except ImportError:  # pragma: no cover - optional at import time
 from agent.event_detector import MACRO_EVENTS, Event, EventDetector
 
 logger = logging.getLogger("daedalus.options_executor")
+
+# Append-only JSONL history of every decision outcome (traded, skipped for
+# budget, no-trade, guard-blocked) — not a database, read back by the MCP
+# server's explain_trade_decision/get_recent_signals-adjacent tools.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TRADES_LOG_PATH = REPO_ROOT / "data" / "trades.jsonl"
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +124,24 @@ class ExecutionResult:
     traded: bool
     detail: str
     order_id: Optional[str] = None
+    dry_run: bool = False
+    # Structured numeric context for explain_trade_decision, so the MCP
+    # server doesn't have to re-parse the human-readable `detail` string.
+    # Populated where relevant: ticker_resolved, is_macro_proxy, equity,
+    # budget, ask/combined_ask, qty, move_pct (straddle only), contracts.
+    extra: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "event": self.event.to_dict(),
+            "decision_mode": self.decision.mode.value,
+            "decision_reason": self.decision.reason,
+            "traded": self.traded,
+            "detail": self.detail,
+            "order_id": self.order_id,
+            "dry_run": self.dry_run,
+            "extra": self.extra,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -327,27 +359,43 @@ class OptionsExecutor:
     def execute_directional(self, event: Event, decision: TradeDecision, today: date) -> ExecutionResult:
         option_type = ContractType.CALL if decision.mode == TradeMode.DIRECTIONAL_CALL else ContractType.PUT
         ticker, proxy_note = self._resolve_ticker(event)
+        base_extra = {"ticker_resolved": ticker, "is_macro_proxy": bool(proxy_note)}
 
         spot = self._spot_price(ticker)
         if spot is None:
-            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}")
+            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", extra=base_extra)
 
         contract = self.select_contract(ticker, option_type, spot, today)
         if contract is None:
-            return ExecutionResult(event, decision, False, f"no tradable {option_type.value} contract found for {ticker} in DTE window")
+            return ExecutionResult(
+                event, decision, False,
+                f"no tradable {option_type.value} contract found for {ticker} in DTE window",
+                extra=base_extra,
+            )
 
         ask = self._latest_option_ask(contract.symbol)
         if not ask:
-            return ExecutionResult(event, decision, False, f"no live ask quote for {contract.symbol}")
+            return ExecutionResult(event, decision, False, f"no live ask quote for {contract.symbol}", extra=base_extra)
 
         equity = self.get_equity()
         budget = self.position_budget(equity)
         sufficient, qty, budget_message = self._check_min_trade_budget(
             event, ticker, f"directional {option_type.value}", budget, ask * 100
         )
+        sizing_extra = {
+            **base_extra,
+            "contract_symbol": contract.symbol,
+            "strike": float(contract.strike_price),
+            "expiration_date": str(contract.expiration_date),
+            "equity": equity,
+            "position_size_pct_of_equity": POSITION_SIZE_PCT_OF_EQUITY,
+            "budget": budget,
+            "ask": ask,
+            "qty": qty,
+        }
         if not sufficient:
             logger.warning(budget_message)
-            return ExecutionResult(event, decision, False, budget_message)
+            return ExecutionResult(event, decision, False, budget_message, extra=sizing_extra)
 
         order_request = LimitOrderRequest(
             symbol=contract.symbol,
@@ -366,36 +414,43 @@ class OptionsExecutor:
 
         if self.dry_run:
             logger.info("[DRY RUN] Would place order: %s", detail)
-            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}")
+            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=sizing_extra)
 
         order = self.trading_client.submit_order(order_request)
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id))
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), extra=sizing_extra)
 
     def execute_straddle(self, event: Event, decision: TradeDecision, today: date) -> ExecutionResult:
         ticker, proxy_note = self._resolve_ticker(event)
+        base_extra = {"ticker_resolved": ticker, "is_macro_proxy": bool(proxy_note)}
 
         confirmed, move_pct = self.confirm_underlying_move(ticker)
+        move_extra = {**base_extra, "underlying_move_pct": move_pct, "move_confirmed": confirmed}
         if not confirmed:
             return ExecutionResult(
                 event, decision, False,
                 f"underlying move {move_pct}% below STRADDLE_MIN_UNDERLYING_MOVE_PCT="
                 f"{STRADDLE_MIN_UNDERLYING_MOVE_PCT}% — volatility not confirmed, skipping straddle",
+                extra=move_extra,
             )
 
         spot = self._spot_price(ticker)
         if spot is None:
-            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}")
+            return ExecutionResult(event, decision, False, f"could not fetch spot price for {ticker}", extra=move_extra)
 
         call_contract = self.select_contract(ticker, ContractType.CALL, spot, today)
         put_contract = self.select_contract(ticker, ContractType.PUT, spot, today)
         if call_contract is None or put_contract is None:
-            return ExecutionResult(event, decision, False, f"could not find both call+put contracts for {ticker} straddle")
+            return ExecutionResult(
+                event, decision, False,
+                f"could not find both call+put contracts for {ticker} straddle",
+                extra=move_extra,
+            )
 
         call_ask = self._latest_option_ask(call_contract.symbol)
         put_ask = self._latest_option_ask(put_contract.symbol)
         if not call_ask or not put_ask:
-            return ExecutionResult(event, decision, False, f"missing live ask quote for {event.ticker} straddle legs")
+            return ExecutionResult(event, decision, False, f"missing live ask quote for {ticker} straddle legs", extra=move_extra)
 
         combined_ask = call_ask + put_ask
         equity = self.get_equity()
@@ -403,9 +458,21 @@ class OptionsExecutor:
         sufficient, qty, budget_message = self._check_min_trade_budget(
             event, ticker, "straddle", budget, combined_ask * 100
         )
+        sizing_extra = {
+            **move_extra,
+            "call_contract_symbol": call_contract.symbol,
+            "put_contract_symbol": put_contract.symbol,
+            "strike": float(call_contract.strike_price),
+            "expiration_date": str(call_contract.expiration_date),
+            "equity": equity,
+            "position_size_pct_of_equity": POSITION_SIZE_PCT_OF_EQUITY,
+            "budget": budget,
+            "combined_ask": combined_ask,
+            "qty": qty,
+        }
         if not sufficient:
             logger.warning(budget_message)
-            return ExecutionResult(event, decision, False, budget_message)
+            return ExecutionResult(event, decision, False, budget_message, extra=sizing_extra)
 
         legs = [
             OptionLegRequest(symbol=call_contract.symbol, ratio_qty=1, side=OrderSide.BUY),
@@ -427,11 +494,11 @@ class OptionsExecutor:
 
         if self.dry_run:
             logger.info("[DRY RUN] Would place order: %s", detail)
-            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}")
+            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=sizing_extra)
 
         order = self.trading_client.submit_order(order_request)
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id))
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), extra=sizing_extra)
 
     def execute_event(self, event: Event, macro_events: list[dict] = MACRO_EVENTS, today: Optional[date] = None) -> ExecutionResult:
         today = today if today is not None else datetime.now(timezone.utc).date()
@@ -439,12 +506,20 @@ class OptionsExecutor:
 
         if decision.mode == TradeMode.NO_TRADE:
             logger.info("No trade for %s/%s: %s", event.event_type, event.ticker, decision.reason)
-            return ExecutionResult(event, decision, False, decision.reason)
+            result = ExecutionResult(event, decision, False, decision.reason)
+        elif decision.mode in (TradeMode.DIRECTIONAL_CALL, TradeMode.DIRECTIONAL_PUT):
+            result = self.execute_directional(event, decision, today)
+        else:
+            result = self.execute_straddle(event, decision, today)
 
-        if decision.mode in (TradeMode.DIRECTIONAL_CALL, TradeMode.DIRECTIONAL_PUT):
-            return self.execute_directional(event, decision, today)
+        self._log_result(result)
+        return result
 
-        return self.execute_straddle(event, decision, today)
+    @staticmethod
+    def _log_result(result: ExecutionResult) -> None:
+        record = result.to_dict()
+        record["timestamp"] = datetime.now(timezone.utc).isoformat()
+        _append_jsonl(TRADES_LOG_PATH, record)
 
 
 # ---------------------------------------------------------------------------
