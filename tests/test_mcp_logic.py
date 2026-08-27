@@ -216,7 +216,10 @@ def test_health_status_reachable_client(monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "fake")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "fake")
 
-    fake_account = SimpleNamespace(status="ACTIVE", options_trading_level=3, equity="100000.0")
+    fake_account = SimpleNamespace(
+        status="ACTIVE", options_trading_level=3,
+        equity="101000.0", cash="50000.0", last_equity="100000.0",
+    )
     fake_client = Mock()
     fake_client.get_account.return_value = fake_account
 
@@ -224,7 +227,12 @@ def test_health_status_reachable_client(monkeypatch):
 
     assert result["alpaca"]["reachable"] is True
     assert result["alpaca"]["error"] is None
-    assert result["alpaca"]["detail"]["equity"] == 100000.0
+    detail = result["alpaca"]["detail"]
+    assert detail["equity"] == 101000.0
+    assert detail["cash"] == 50000.0
+    assert detail["last_equity"] == 100000.0
+    assert detail["day_pl_dollars"] == 1000.0
+    assert detail["day_pl_pct"] == 1.0
 
 
 def test_health_status_unreachable_client_reports_error(monkeypatch):

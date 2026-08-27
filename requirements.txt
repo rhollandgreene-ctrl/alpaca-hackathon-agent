@@ -5,3 +5,4 @@ pandas>=2.2.3
 pytest>=8.3.3
 alpaca-py>=0.44.0
 mcp[cli]<2
+streamlit>=1.62.0

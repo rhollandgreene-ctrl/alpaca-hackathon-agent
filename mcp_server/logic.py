@@ -194,10 +194,24 @@ def get_health_status(trading_client=None) -> dict:
         try:
             account = trading_client.get_account()
             alpaca_reachable = True
+            equity = float(account.equity)
+            cash = float(account.cash) if account.cash is not None else None
+            # last_equity = equity as of the previous trading day's close
+            # (Alpaca-computed, not derived here). Alpaca's account object
+            # has no direct "day P&L" field, so day change is computed the
+            # same way Alpaca's own web dashboard does: current equity minus
+            # that prior-close equity.
+            last_equity = float(account.last_equity) if account.last_equity is not None else None
+            day_pl_dollars = (equity - last_equity) if last_equity is not None else None
+            day_pl_pct = ((equity - last_equity) / last_equity * 100) if last_equity else None
             alpaca_detail = {
                 "account_status": str(account.status),
                 "options_trading_level": account.options_trading_level,
-                "equity": float(account.equity),
+                "equity": equity,
+                "cash": cash,
+                "last_equity": last_equity,
+                "day_pl_dollars": day_pl_dollars,
+                "day_pl_pct": day_pl_pct,
             }
         except Exception as e:
             alpaca_error = str(e)
