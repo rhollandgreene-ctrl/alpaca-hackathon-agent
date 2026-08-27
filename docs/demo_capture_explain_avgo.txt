@@ -1,0 +1,22 @@
+{
+  "is_mocked": false,
+  "found": true,
+  "record": {
+    "event": {
+      "event_type": "earnings_upcoming",
+      "ticker": "AVGO",
+      "timestamp": "2026-08-26T23:18:36.818826+00:00",
+      "description": "AVGO has upcoming earnings on 2026-09-02",
+      "sentiment_score": 0.857,
+      "confidence": 1.0
+    },
+    "decision_mode": "no_trade",
+    "decision_reason": "earnings_upcoming is pre-event by definition — only earnings_surprise is eligible",
+    "traded": false,
+    "detail": "earnings_upcoming is pre-event by definition — only earnings_surprise is eligible",
+    "order_id": null,
+    "dry_run": true,
+    "extra": {},
+    "timestamp": "2026-08-26T23:19:43.963444+00:00"
+  }
+}

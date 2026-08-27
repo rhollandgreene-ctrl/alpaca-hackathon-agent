@@ -62,9 +62,9 @@ Add to `claude_desktop_config.json` (adjust the path to your checkout):
 {
   "mcpServers": {
     "daedalus": {
-      "command": "C:\\Users\\Admin\\alpaca-hackathon-agent\\.venv\\Scripts\\python.exe",
+      "command": "<path-to-your-checkout>\\.venv\\Scripts\\python.exe",
       "args": ["-m", "mcp_server.server"],
-      "cwd": "C:\\Users\\Admin\\alpaca-hackathon-agent"
+      "cwd": "<path-to-your-checkout>"
     }
   }
 }

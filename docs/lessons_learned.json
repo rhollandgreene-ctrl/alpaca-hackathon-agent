@@ -36,7 +36,7 @@
     "date": "2026-08-25",
     "component": "agent/options_executor.py",
     "title": "Contract expiration filtering must happen server-side, not client-side",
-    "summary": "select_contract() originally queried expiration_date_gte=today and filtered the target DTE window (3-14 days) client-side after the fact. For names with dense near-term expirations (SPY lists near-daily expiries), a single 100-contract page came back entirely 0DTE strikes before ever reaching the 3-14 DTE window -- select_contract returned None even though valid contracts existed. Fixed by setting expiration_date_gte to today+TARGET_DTE_MIN directly in the API request.",
+    "summary": "select_contract() originally queried expiration_date_gte=today and filtered the target DTE window client-side after the fact. For names with dense near-term expirations (SPY lists near-daily expiries), a single contract page came back entirely near-zero-DTE strikes before ever reaching the target window -- select_contract returned None even though valid contracts existed. Fixed by setting expiration_date_gte directly in the API request instead of filtering after the fact.",
     "impact": "Found live against the real paper account testing the SPY macro-proxy path -- would have silently produced 'no contract found' for the flagship Jackson Hole trade."
   },
   {
@@ -44,7 +44,7 @@
     "date": "2026-08-25",
     "component": "agent/options_executor.py",
     "title": "Position size vs. real option premiums",
-    "summary": "Live verification showed 1% of a $100k paper account ($1,000) frequently couldn't afford a single ATM contract at real SPY/NVDA premiums, let alone both legs of a straddle -- trades were silently sized to qty=0 and skipped. Bumped POSITION_SIZE_PCT_OF_EQUITY to 1.5% and added an explicit _check_min_trade_budget gate that logs a distinct \"SKIPPED: ...\" message (not folded into a generic no-trade log) whenever a signal clears every eligibility/confidence/sentiment gate but can't be sized.",
+    "summary": "Live verification showed the original per-trade budget frequently couldn't afford a single ATM contract at real SPY/NVDA premiums, let alone both legs of a straddle -- trades were silently sized to qty=0 and skipped. Increased the per-trade equity allocation and added an explicit _check_min_trade_budget gate that logs a distinct \"SKIPPED: ...\" message (not folded into a generic no-trade log) whenever a signal clears every eligibility/confidence/sentiment gate but can't be sized.",
     "impact": "Prevents the failure mode of 'the system went quiet' being ambiguous between 'nothing qualified' and 'something qualified but couldn't be sized' -- critical for reading the system correctly live during a demo."
   }
 ]

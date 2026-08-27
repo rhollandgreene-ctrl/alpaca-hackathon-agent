@@ -335,7 +335,6 @@ def test_get_earnings_dates_exception_still_reaches_stability_check(monkeypatch,
 
 
 def test_changing_earnings_date_between_polls_logs_warning(monkeypatch, caplog):
-    today = date(2026, 8, 26)
     first_date = date(2026, 9, 2)
     second_date = date(2026, 9, 9)  # mirrors AVAV's observed shift
     poll = {"n": 1}

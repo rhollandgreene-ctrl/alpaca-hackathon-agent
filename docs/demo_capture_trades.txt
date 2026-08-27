@@ -1,0 +1,46 @@
+2026-08-26 16:19:24,244 [WARNING] yfinance earnings lookup failed for CHWY
+Traceback (most recent call last):
+  File "<checkout>\agent\event_detector.py", line 406, in check_earnings
+    edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
+  File "<checkout>\.venv\Lib\site-packages\yfinance\base.py", line 640, in get_earnings_dates
+    df = self._get_earnings_dates_using_scrape(limit, offset)
+  File "<checkout>\.venv\Lib\site-packages\yfinance\utils.py", line 124, in wrapper
+    result = func(*args, **kwargs)
+  File "<checkout>\.venv\Lib\site-packages\yfinance\base.py", line 718, in _get_earnings_dates_using_scrape
+    df = df.dropna(subset="Earnings Date")
+  File "<checkout>\.venv\Lib\site-packages\pandas\core\frame.py", line 7803, in dropna
+    raise KeyError(np.array(subset)[check].tolist())
+KeyError: ['Earnings Date']
+2026-08-26 16:19:43,958 [INFO] No trade for macro_jackson_hole/None: macro_jackson_hole is scheduled for 2026-08-28, which hasn't happened yet (today=2026-08-26)
+2026-08-26 16:19:43,959 [INFO] No trade for earnings_upcoming/DELL: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,959 [INFO] No trade for earnings_upcoming/PANW: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,960 [INFO] No trade for earnings_upcoming/MDT: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,961 [INFO] No trade for earnings_upcoming/MDB: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,962 [INFO] No trade for earnings_upcoming/NIO: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,962 [INFO] No trade for earnings_upcoming/GTLB: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,963 [INFO] No trade for earnings_upcoming/AVGO: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,964 [INFO] No trade for earnings_upcoming/SNOW: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,964 [INFO] No trade for earnings_upcoming/HPE: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,966 [INFO] No trade for earnings_upcoming/NTAP: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,967 [INFO] No trade for earnings_upcoming/FIVE: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,967 [INFO] No trade for earnings_upcoming/AVAV: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,968 [INFO] No trade for earnings_upcoming/OLLI: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,969 [INFO] No trade for earnings_upcoming/PVH: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,969 [INFO] No trade for earnings_upcoming/AI: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,970 [INFO] No trade for earnings_upcoming/CHPT: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,970 [INFO] No trade for earnings_upcoming/CIEN: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,971 [INFO] No trade for earnings_upcoming/CPRT: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,972 [INFO] No trade for earnings_upcoming/ZS: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,972 [INFO] No trade for earnings_upcoming/IOT: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,973 [INFO] No trade for earnings_upcoming/GWRE: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,973 [INFO] No trade for earnings_upcoming/LULU: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,974 [INFO] No trade for earnings_upcoming/DOCU: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,975 [INFO] No trade for earnings_upcoming/PATH: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,975 [INFO] No trade for earnings_upcoming/ASAN: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,976 [INFO] No trade for earnings_upcoming/CPB: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,976 [INFO] No trade for earnings_upcoming/CASY: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,977 [INFO] No trade for earnings_upcoming/CNM: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,978 [INFO] No trade for earnings_upcoming/GME: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,979 [INFO] No trade for earnings_upcoming/COO: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,979 [INFO] No trade for earnings_upcoming/AEO: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible
+2026-08-26 16:19:43,981 [INFO] No trade for earnings_upcoming/ASO: earnings_upcoming is pre-event by definition — only earnings_surprise is eligible

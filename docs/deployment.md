@@ -1,6 +1,6 @@
 # Deploying Daedalus (Hetzner)
 
-Daedalus runs on the same Hetzner box as Atlas and Icarus (`89.167.53.40`,
+Daedalus runs on the same Hetzner box as Atlas and Icarus (`<server-ip>`,
 user `agent`), as a single systemd service.
 
 ## Layout
