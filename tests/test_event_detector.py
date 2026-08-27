@@ -283,6 +283,57 @@ def test_disappearing_earnings_row_is_synthesized_from_calendar_with_warning(mon
     assert any("synthesizing earnings_upcoming from calendar" in r.message for r in caplog.records)
 
 
+def test_get_earnings_dates_exception_still_reaches_stability_check(monkeypatch, caplog):
+    # Reproduces the CHWY-style failure caught live: get_earnings_dates()
+    # threw (KeyError: ['Earnings Date']) on the poll right after a prior
+    # poll had it active. The exception must not skip the ticker past the
+    # stability check -- it should still get the calendar cross-check and
+    # synthesized fallback, same as a silent empty/None result.
+    today = date(2026, 8, 26)
+    poll = {"n": 1}
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            if self.ticker != "CHWY":
+                return None
+            if poll["n"] == 1:
+                return _make_earnings_df(today)
+            raise KeyError(["Earnings Date"])  # poll 2+: scrape/parse blew up
+
+        @property
+        def calendar(self):
+            return {"Earnings Date": [today]} if self.ticker == "CHWY" else {}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+
+    detector = EventDetector(watchlist=["CHWY"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+
+    now = datetime(2026, 8, 26, 21, 0, tzinfo=timezone.utc)
+
+    events_1 = detector.check_earnings(now=now)
+    assert len(events_1) == 1
+    assert events_1[0].ticker == "CHWY"
+
+    poll["n"] = 2
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        events_2 = detector.check_earnings(now=now)
+
+    # The exception is still logged (pre-existing behavior)...
+    assert any("yfinance earnings lookup failed for CHWY" in r.message for r in caplog.records)
+    # ...but the ticker is recovered via calendar rather than silently
+    # dropped, same as the non-exception disappearance case.
+    assert len(events_2) == 1
+    assert events_2[0].event_type == "earnings_upcoming"
+    assert events_2[0].ticker == "CHWY"
+    assert any("EARNINGS DATE INSTABILITY" in r.message for r in caplog.records)
+    assert any("synthesizing earnings_upcoming from calendar" in r.message for r in caplog.records)
+
+
 def test_changing_earnings_date_between_polls_logs_warning(monkeypatch, caplog):
     today = date(2026, 8, 26)
     first_date = date(2026, 9, 2)

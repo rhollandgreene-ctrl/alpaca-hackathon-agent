@@ -405,8 +405,15 @@ class EventDetector:
             try:
                 edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
             except Exception:
+                # Caught here so one ticker's scrape failure (observed live:
+                # a KeyError from yfinance's own HTML parsing) doesn't abort
+                # the whole watchlist pass -- but edf falls through as None
+                # rather than `continue`-ing past it, so this ticker still
+                # reaches _check_earnings_date_stability below and gets the
+                # same calendar cross-check/synthesis safety net as a
+                # silently-empty result, instead of being skipped bare.
                 logger.warning("yfinance earnings lookup failed for %s", ticker, exc_info=True)
-                continue
+                edf = None
 
             active_dates: list[date] = []
 
