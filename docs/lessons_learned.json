@@ -54,5 +54,13 @@
     "title": "Exit logic is take-profit and max-hold only -- deliberately no stop-loss",
     "summary": "Before this, positions opened and simply sat until expiry with no automated exit at all. Added check_and_close_positions(), polled every cycle: closes a position once its unrealized gain reaches a configurable take-profit threshold, or once it's within a configurable number of days of expiring (to avoid pin risk/illiquidity right at expiration). Deliberately did NOT add a stop-loss or any loss-triggered exit. This is not an oversight: every position Daedalus opens is a bought (long) call, put, or straddle -- never written/sold -- so loss per trade is already bounded to the premium paid by construction. A stop-loss would realize that already-bounded loss early on paths that might otherwise recover, cutting into the exact convexity the premium bought.",
     "impact": "Positions no longer ride to expiry unmanaged on the upside or the max-hold/pin-risk side, without introducing a loss-triggered exit that would work against the defined-risk, long-only design the entry side already guarantees."
+  },
+  {
+    "id": "daily-trade-guard-persistence",
+    "date": "2026-08-28",
+    "component": "agent/options_executor.py",
+    "title": "DailyTradeGuard's same-day dedup state didn't survive a restart",
+    "summary": "DailyTradeGuard tracks which signals have already traded today so the poll loop doesn't re-fire the same entry every cycle while it stays qualified -- but that state lived in memory only and reset on process restart. This wasn't caught in testing; it surfaced live in production, when a mid-day service restart lost the guard's memory and let an already-traded signal re-qualify, firing a duplicate entry on the same event. Fixed by persisting the guard's daily state to a small local file, reloaded on startup with same-day validation -- a file left over from a prior day is discarded outright, not treated as still current.",
+    "impact": "The fix itself needed one more restart to fully take effect: the persistence file didn't exist yet from trades placed before the fix shipped, so that first restart under the new code still produced one more duplicate before any state had ever been written to disk. The very next restart loaded the now-existing file correctly and blocked a further duplicate on the same signal -- a live, real-world confirmation of the fix working as intended, on the first restart that could actually exercise it."
   }
 ]
