@@ -95,6 +95,14 @@ TRADES_LOG_PATH = REPO_ROOT / "data" / "trades.jsonl"
 # alone, before ever reading a single field.
 EXITS_LOG_PATH = REPO_ROOT / "data" / "exits.jsonl"
 
+# DailyTradeGuard's persisted dedup snapshot for "today" — a small JSON
+# object rewritten on each trade, not an append-only log like the two
+# paths above. See DailyTradeGuard for why this exists: a restart mid-day
+# used to lose all same-day dedup state and could re-fire an already-
+# placed trade (observed live: a mid-signal restart duplicated an NVDA
+# entry on 2026-08-28).
+GUARD_STATE_PATH = REPO_ROOT / "data" / "trade_guard_state.json"
+
 
 def _append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -776,14 +784,48 @@ class OptionsExecutor:
 # Wiring loop: polls the detector, evaluates every event, executes qualifying ones.
 
 class DailyTradeGuard:
-    """In-memory, process-lifetime dedup + daily trade cap. Resets at UTC
-    midnight. Does not persist across restarts — see module docstring."""
+    """Dedup + daily trade cap. Resets at UTC midnight. Persisted to
+    state_path (a small JSON snapshot, rewritten on each trade — no
+    database) so a restart mid-day doesn't lose same-day dedup and
+    re-fire a trade already placed earlier today. Only today's entries
+    are ever loaded back in; a state file from a different day is
+    ignored outright, since this guard is daily, not permanent."""
 
-    def __init__(self, max_trades_per_day: int = MAX_TRADES_PER_DAY):
+    def __init__(
+        self,
+        max_trades_per_day: int = MAX_TRADES_PER_DAY,
+        state_path: Path = GUARD_STATE_PATH,
+        today: Optional[date] = None,
+    ):
         self.max_trades_per_day = max_trades_per_day
+        self.state_path = state_path
         self._day: Optional[date] = None
         self._traded_keys: set[tuple[str, Optional[str]]] = set()
         self._trade_count = 0
+        self._load_state(today if today is not None else datetime.now(timezone.utc).date())
+
+    def _load_state(self, today: date) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            with self.state_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read trade guard state from %s — starting with empty state", self.state_path)
+            return
+
+        if data.get("date") != today.isoformat():
+            return  # stale (different day) or malformed — start fresh for today
+
+        self._day = today
+        self._traded_keys = {tuple(key) for key in data.get("keys", [])}
+        self._trade_count = len(self._traded_keys)
+
+    def _save_state(self, today: date) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"date": today.isoformat(), "keys": [list(key) for key in self._traded_keys]}
+        with self.state_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f)
 
     def _roll_if_new_day(self, today: date) -> None:
         if self._day != today:
@@ -807,6 +849,7 @@ class DailyTradeGuard:
         self._roll_if_new_day(today)
         self._traded_keys.add((event.event_type, event.ticker))
         self._trade_count += 1
+        self._save_state(today)
 
 
 def run_cycle(

@@ -166,9 +166,12 @@ def test_thresholds_are_boundary_correct():
 
 
 # -- daily trade guard --------------------------------------------------------
+# state_path is always pointed at tmp_path here -- DailyTradeGuard now
+# persists to disk by default (GUARD_STATE_PATH), and these tests must
+# never touch the real data/trade_guard_state.json.
 
-def test_guard_blocks_repeat_trade_on_same_event_same_day():
-    guard = DailyTradeGuard(max_trades_per_day=5)
+def test_guard_blocks_repeat_trade_on_same_event_same_day(tmp_path):
+    guard = DailyTradeGuard(max_trades_per_day=5, state_path=tmp_path / "state.json")
     event = make_event("earnings_surprise", ticker="NVDA", sentiment_score=0.6, confidence=0.8)
     today = date(2026, 8, 26)
 
@@ -182,8 +185,8 @@ def test_guard_blocks_repeat_trade_on_same_event_same_day():
     assert "already traded" in reason
 
 
-def test_guard_allows_different_ticker_same_day():
-    guard = DailyTradeGuard(max_trades_per_day=5)
+def test_guard_allows_different_ticker_same_day(tmp_path):
+    guard = DailyTradeGuard(max_trades_per_day=5, state_path=tmp_path / "state.json")
     today = date(2026, 8, 26)
     nvda_event = make_event("earnings_surprise", ticker="NVDA", confidence=0.8)
     aapl_event = make_event("earnings_surprise", ticker="AAPL", confidence=0.8)
@@ -193,8 +196,8 @@ def test_guard_allows_different_ticker_same_day():
     assert may_attempt is True
 
 
-def test_guard_enforces_max_trades_per_day():
-    guard = DailyTradeGuard(max_trades_per_day=2)
+def test_guard_enforces_max_trades_per_day(tmp_path):
+    guard = DailyTradeGuard(max_trades_per_day=2, state_path=tmp_path / "state.json")
     today = date(2026, 8, 26)
     events = [make_event("earnings_surprise", ticker=t, confidence=0.8) for t in ["AAPL", "MSFT", "TSLA"]]
 
@@ -208,8 +211,8 @@ def test_guard_enforces_max_trades_per_day():
     assert "MAX_TRADES_PER_DAY" in reason
 
 
-def test_guard_resets_on_new_day():
-    guard = DailyTradeGuard(max_trades_per_day=1)
+def test_guard_resets_on_new_day(tmp_path):
+    guard = DailyTradeGuard(max_trades_per_day=1, state_path=tmp_path / "state.json")
     event = make_event("earnings_surprise", ticker="NVDA", confidence=0.8)
 
     guard.record_trade(event, today=date(2026, 8, 26))
@@ -218,6 +221,64 @@ def test_guard_resets_on_new_day():
 
     may_attempt_next_day, _ = guard.should_attempt(event, today=date(2026, 8, 27))
     assert may_attempt_next_day is True
+
+
+# -- daily trade guard: persistence across restart ---------------------------
+# Reproduces exactly what happened live on 2026-08-28: a mid-signal
+# restart lost the in-memory guard state and let NVDA's earnings_surprise
+# event fire a second, duplicate entry. state_path now persists across
+# separate DailyTradeGuard instances, simulating a process restart.
+
+def test_guard_state_persists_across_restart_and_blocks_duplicate(tmp_path):
+    state_path = tmp_path / "trade_guard_state.json"
+    today = date(2026, 8, 28)
+    event = make_event("earnings_surprise", ticker="NVDA", sentiment_score=0.733, confidence=0.667)
+
+    guard_before_restart = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=today)
+    may_attempt, _ = guard_before_restart.should_attempt(event, today=today)
+    assert may_attempt is True
+    guard_before_restart.record_trade(event, today=today)
+
+    # Simulate a process restart: a brand new instance, no shared memory
+    # with the one above -- only the state file connects them.
+    guard_after_restart = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=today)
+
+    may_attempt_after_restart, reason = guard_after_restart.should_attempt(event, today=today)
+    assert may_attempt_after_restart is False
+    assert "already traded" in reason
+
+
+def test_guard_does_not_load_state_from_a_previous_day(tmp_path):
+    # The guard is daily, not permanent -- a state file left over from
+    # yesterday must not carry a "traded" key forward into today.
+    state_path = tmp_path / "trade_guard_state.json"
+    event = make_event("earnings_surprise", ticker="NVDA", confidence=0.8)
+
+    yesterday_guard = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=date(2026, 8, 27))
+    yesterday_guard.record_trade(event, today=date(2026, 8, 27))
+
+    today_guard = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=date(2026, 8, 28))
+    may_attempt, _ = today_guard.should_attempt(event, today=date(2026, 8, 28))
+    assert may_attempt is True  # not blocked -- yesterday's entry must not carry over
+
+
+def test_guard_state_file_survives_a_second_trade_same_day(tmp_path):
+    # Not just the first trade -- the persisted set must accumulate, so a
+    # restart after the *second* same-day trade still blocks both.
+    state_path = tmp_path / "trade_guard_state.json"
+    today = date(2026, 8, 28)
+    nvda_event = make_event("earnings_surprise", ticker="NVDA", confidence=0.8)
+    aapl_event = make_event("earnings_surprise", ticker="AAPL", confidence=0.8)
+
+    guard1 = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=today)
+    guard1.record_trade(nvda_event, today=today)
+    guard1.record_trade(aapl_event, today=today)
+
+    guard2 = DailyTradeGuard(max_trades_per_day=5, state_path=state_path, today=today)
+    nvda_attempt, _ = guard2.should_attempt(nvda_event, today=today)
+    aapl_attempt, _ = guard2.should_attempt(aapl_event, today=today)
+    assert nvda_attempt is False
+    assert aapl_attempt is False
 
 
 # -- budget-sufficiency gate --------------------------------------------------
