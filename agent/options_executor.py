@@ -29,6 +29,19 @@ Design notes:
   This forgets history on restart by design — consistent with the
   no-database approach in event_detector.py. A restart mid-day can
   duplicate a trade already placed earlier that day.
+- Exit logic is take-profit and max-hold ONLY — deliberately no
+  stop-loss / loss-triggered exit. Every position Daedalus opens is a
+  bought (long) option — is_event_eligible/decide_trade_mode/
+  execute_directional/execute_straddle never construct a short or
+  written position, so loss per trade is already bounded to the premium
+  paid, by construction. A stop-loss would realize that already-bounded
+  loss early on paths that might otherwise recover, cutting into the
+  exact convexity the premium bought. So only two automated exits exist:
+  take-profit (unrealized gain reaches TAKE_PROFIT_PCT of premium paid)
+  and max-hold (fewer than MAX_HOLD_DAYS_BEFORE_EXPIRY days left before
+  expiry, to avoid pin risk/illiquidity right at expiration).
+  decide_exit() is pure (no network calls), same split as
+  decide_trade_mode()/execute_directional() on the entry side.
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -53,7 +67,7 @@ except ImportError:  # pragma: no cover - optional at import time
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.enums import ContractType, OrderClass, OrderSide, TimeInForce
+    from alpaca.trading.enums import AssetClass, ContractType, OrderClass, OrderSide, PositionSide, TimeInForce
     from alpaca.trading.requests import (
         GetOptionContractsRequest,
         LimitOrderRequest,
@@ -75,11 +89,37 @@ logger = logging.getLogger("daedalus.options_executor")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRADES_LOG_PATH = REPO_ROOT / "data" / "trades.jsonl"
 
+# Separate from TRADES_LOG_PATH on purpose: an exit record has a different
+# shape (no Event/TradeDecision, since it's not triggered by a detected
+# event) and this makes opens vs. closes distinguishable at the file level
+# alone, before ever reading a single field.
+EXITS_LOG_PATH = REPO_ROOT / "data" / "exits.jsonl"
+
 
 def _append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    """Local, minimal JSONL reader — deliberately not shared with
+    mcp_server/logic.py's read_jsonl to avoid agent/ depending on
+    mcp_server/ (wrong layering direction); same no-database tradeoff as
+    _append_jsonl above."""
+    if not path.exists():
+        return []
+    records = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +139,15 @@ STRIKE_WINDOW_PCT = 0.15  # only consider strikes within +/-15% of spot when sel
 MAX_TRADES_PER_DAY = 5
 POLL_INTERVAL_SECONDS = 1800
 
+# -- Exit logic: take-profit and max-hold ONLY. Deliberately no stop-loss —
+# see the module docstring's "Exit logic" note for why.
+TAKE_PROFIT_PCT = 0.50  # close once unrealized gain reaches +50% of premium paid
+MAX_HOLD_DAYS_BEFORE_EXPIRY = 2  # close once fewer than this many days remain before expiry
+
+# Standard OCC option symbol: root + YYMMDD + C/P + 8-digit strike
+# (e.g. NVDA260831C00222500 -> underlying NVDA, expires 2026-08-31).
+_OCC_SYMBOL_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
+
 # Macro events (Jackson Hole, FOMC, CPI, ...) have ticker=None in the Event
 # schema — they're not stock-specific. This is the underlying options are
 # actually traded on when a macro event fires a directional/straddle trade.
@@ -110,6 +159,13 @@ class TradeMode(str, Enum):
     DIRECTIONAL_CALL = "directional_call"
     DIRECTIONAL_PUT = "directional_put"
     STRADDLE = "straddle"
+
+
+class ExitReason(str, Enum):
+    TAKE_PROFIT = "take_profit"
+    MAX_HOLD = "max_hold"
+    # No LOSS_STOP / STOP_LOSS member exists here — deliberately, see the
+    # module docstring's "Exit logic" note.
 
 
 @dataclass
@@ -221,6 +277,36 @@ def decide_trade_mode(
     )
 
 
+def decide_exit(unrealized_plpc: float, days_to_expiry: int) -> Optional[ExitReason]:
+    """Pure exit decision — no network calls, unit-testable without Alpaca.
+
+    Take-profit and max-hold ONLY. There is deliberately no stop-loss /
+    loss-triggered branch here — see the module docstring's "Exit logic"
+    note. Take-profit is checked first: if a position is both up big and
+    close to expiry, that's reported as a take-profit exit (the reason
+    we're actually closing), not a max-hold exit.
+    """
+    if unrealized_plpc >= TAKE_PROFIT_PCT:
+        return ExitReason.TAKE_PROFIT
+    if days_to_expiry < MAX_HOLD_DAYS_BEFORE_EXPIRY:
+        return ExitReason.MAX_HOLD
+    return None
+
+
+def parse_occ_expiration(symbol: str) -> Optional[date]:
+    """Extract the expiration date from a standard OCC option symbol
+    (e.g. "NVDA260831C00222500" -> date(2026, 8, 31)) without an extra
+    API call — the same symbol format select_contract() already produces.
+    Returns None if `symbol` doesn't match the expected shape."""
+    match = _OCC_SYMBOL_RE.match(symbol)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(2), "%y%m%d").date()
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Live execution layer
 
@@ -309,6 +395,18 @@ class OptionsExecutor:
         if quote is None or not quote.ask_price:
             return None
         return float(quote.ask_price)
+
+    def _latest_option_bid(self, symbol: str) -> Optional[float]:
+        # Mirrors _latest_option_ask, but for closing: a sell-to-close
+        # marketable limit should be priced at the bid, the same way an
+        # opening buy is priced at the ask.
+        quotes = self.option_data_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
+        )
+        quote = quotes.get(symbol)
+        if quote is None or not quote.bid_price:
+            return None
+        return float(quote.bid_price)
 
     def _spot_price(self, ticker: str) -> Optional[float]:
         snapshot = self.stock_data_client.get_stock_snapshot(
@@ -522,6 +620,157 @@ class OptionsExecutor:
         record["timestamp"] = datetime.now(timezone.utc).isoformat()
         _append_jsonl(TRADES_LOG_PATH, record)
 
+    # -- exit logic: take-profit / max-hold only, no stop-loss ---------------
+
+    def check_and_close_positions(self, today: Optional[date] = None) -> list[dict]:
+        """Poll-cycle exit check. Closes (sell-to-close) any open option
+        position that has hit take-profit or is within
+        MAX_HOLD_DAYS_BEFORE_EXPIRY of expiring. Deliberately no stop-loss
+        path — see module docstring. decide_exit() is the pure decision;
+        this method is the live orchestration around it, same split as
+        decide_trade_mode()/execute_directional() on the entry side. This
+        never touches is_event_eligible/decide_trade_mode/execute_directional/
+        execute_straddle — entry-side logic is untouched by this feature.
+        """
+        today = today if today is not None else datetime.now(timezone.utc).date()
+        positions = self.trading_client.get_all_positions()
+        results = []
+
+        for position in positions:
+            if position.asset_class != AssetClass.US_OPTION:
+                continue
+
+            expiration = parse_occ_expiration(position.symbol)
+            if expiration is None:
+                logger.warning(
+                    "Could not parse expiration from option symbol %s — skipping exit check this cycle",
+                    position.symbol,
+                )
+                continue
+
+            if position.unrealized_plpc is None:
+                continue
+            unrealized_plpc = float(position.unrealized_plpc)
+            days_to_expiry = (expiration - today).days
+
+            reason = decide_exit(unrealized_plpc, days_to_expiry)
+            if reason is None:
+                continue
+
+            result = self._close_position(position, reason, unrealized_plpc, days_to_expiry, expiration)
+            results.append(result)
+
+        return results
+
+    def _find_entry_reference(self, contract_symbol: str) -> Optional[dict]:
+        """Best-effort cross-reference to the trades.jsonl record that
+        opened this contract symbol, for context in the exit log — not
+        authoritative, just a convenience. None is a normal, expected
+        result if the entry predates this feature or isn't found."""
+        for record in reversed(_read_jsonl(TRADES_LOG_PATH)):
+            extra = record.get("extra") or {}
+            if contract_symbol in (
+                extra.get("contract_symbol"),
+                extra.get("call_contract_symbol"),
+                extra.get("put_contract_symbol"),
+            ):
+                event = record.get("event") or {}
+                return {
+                    "event_type": event.get("event_type"),
+                    "ticker": event.get("ticker"),
+                    "order_id": record.get("order_id"),
+                }
+        return None
+
+    def _close_position(
+        self, position, reason: ExitReason, unrealized_plpc: float,
+        days_to_expiry: int, expiration: date,
+    ) -> dict:
+        base_record = {
+            "action": "close_position",
+            "contract_symbol": position.symbol,
+            "exit_reason": reason.value,
+            "unrealized_plpc": unrealized_plpc,
+            "unrealized_pl_dollars": float(position.unrealized_pl) if position.unrealized_pl is not None else None,
+            "days_to_expiry": days_to_expiry,
+            "expiration": expiration.isoformat(),
+            "entry_reference": self._find_entry_reference(position.symbol),
+            "dry_run": self.dry_run,
+        }
+
+        if position.side != PositionSide.LONG:
+            # Daedalus never opens a short/written position (see module
+            # docstring) — every position this code has ever opened is
+            # long, so an automated close is always a sell. A short
+            # position here would mean something else wrote it; refuse
+            # rather than guess the correct close side.
+            message = (
+                f"CLOSE SKIPPED: {position.symbol} is a {position.side.value} position — "
+                f"Daedalus never opens short positions, refusing to guess the correct close side"
+            )
+            logger.error(message)
+            record = {
+                **base_record, "closed": False, "qty": None, "limit_price": None,
+                "order_id": None, "detail": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._log_exit(record)
+            return record
+
+        qty = abs(int(float(position.qty)))
+        bid = self._latest_option_bid(position.symbol)
+
+        if bid is None:
+            message = (
+                f"CLOSE SKIPPED: no live bid quote for {position.symbol}, "
+                f"exit_reason={reason.value} deferred to next poll"
+            )
+            logger.warning(message)
+            record = {
+                **base_record, "closed": False, "qty": qty, "limit_price": None,
+                "order_id": None, "detail": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._log_exit(record)
+            return record
+
+        order_request = LimitOrderRequest(
+            symbol=position.symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(bid, 2),
+        )
+
+        detail = (
+            f"SELL-TO-CLOSE {qty}x {position.symbol} @ limit ${bid:.2f} | exit_reason={reason.value} "
+            f"unrealized_plpc={unrealized_plpc:.4f} days_to_expiry={days_to_expiry}"
+        )
+
+        if self.dry_run:
+            logger.info("[DRY RUN] Would close position (sell-to-close): %s", detail)
+            record = {
+                **base_record, "closed": False, "qty": qty, "limit_price": round(bid, 2),
+                "order_id": None, "detail": f"[DRY RUN] {detail}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._log_exit(record)
+            return record
+
+        order = self.trading_client.submit_order(order_request)
+        logger.info("Position CLOSE submitted (sell-to-close): %s | order_id=%s", detail, order.id)
+        record = {
+            **base_record, "closed": True, "qty": qty, "limit_price": round(bid, 2),
+            "order_id": str(order.id), "detail": detail,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._log_exit(record)
+        return record
+
+    @staticmethod
+    def _log_exit(record: dict) -> None:
+        _append_jsonl(EXITS_LOG_PATH, record)
+
 
 # ---------------------------------------------------------------------------
 # Wiring loop: polls the detector, evaluates every event, executes qualifying ones.
@@ -570,9 +819,19 @@ def run_cycle(
     earnings so a qualifying flagship macro signal takes priority, but
     every qualifying event this cycle gets evaluated — earnings isn't
     only consulted when macro produces nothing; it's simply checked
-    every cycle, same as macro, and MAX_TRADES_PER_DAY is the only cap."""
+    every cycle, same as macro, and MAX_TRADES_PER_DAY is the only cap.
+
+    Exit checks (take-profit / max-hold, see check_and_close_positions)
+    run first, every cycle, independent of and before any new entries —
+    this only ever closes what's already open; it never touches
+    entry-side eligibility/sizing.
+    """
     now = now or datetime.now(timezone.utc)
     today = now.date()
+
+    exit_results = executor.check_and_close_positions(today=today)
+    if exit_results:
+        logger.info("Closed %d position(s) this cycle", sum(1 for r in exit_results if r["closed"]))
 
     macro_events = detector.check_macro_events(now=now)
     earnings_events = detector.check_earnings(now=now)

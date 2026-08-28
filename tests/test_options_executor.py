@@ -18,18 +18,25 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from alpaca.trading.enums import AssetClass, OrderSide, PositionSide
+
 from agent.event_detector import Event
 from agent.options_executor import (
     DIRECTIONAL_SENTIMENT_THRESHOLD,
+    MAX_HOLD_DAYS_BEFORE_EXPIRY,
     MIN_CONFIDENCE_TO_TRADE,
     POSITION_SIZE_PCT_OF_EQUITY,
     STRADDLE_MIN_CONFIDENCE,
+    TAKE_PROFIT_PCT,
     DailyTradeGuard,
+    ExitReason,
     OptionsExecutor,
     TradeDecision,
     TradeMode,
+    decide_exit,
     decide_trade_mode,
     is_event_eligible,
+    parse_occ_expiration,
 )
 
 TEST_MACRO_EVENTS = [
@@ -302,3 +309,199 @@ def test_budget_skip_message_is_distinct_from_no_trade_reason():
 
     assert budget_result.detail.startswith("SKIPPED:")
     assert budget_result.detail != no_trade_decision.reason
+
+
+# -- exit logic: decide_exit() is pure — no network calls -------------------
+# Take-profit and max-hold ONLY. No stop-loss / loss-triggered branch
+# exists anywhere in this module; see the module docstring's "Exit logic"
+# note for why (loss is already bounded to premium paid by construction,
+# since every position is bought/long -- see the no-short-positions tests
+# in this file already).
+
+def test_exit_reason_has_no_stop_loss_member():
+    # Structural guarantee, not just behavioral: the enum itself has no
+    # loss-triggered member to accidentally wire up later.
+    assert {m.value for m in ExitReason} == {"take_profit", "max_hold"}
+
+
+def test_take_profit_fires_at_threshold():
+    assert decide_exit(unrealized_plpc=TAKE_PROFIT_PCT, days_to_expiry=10) == ExitReason.TAKE_PROFIT
+
+
+def test_take_profit_does_not_fire_just_below_threshold():
+    assert decide_exit(unrealized_plpc=TAKE_PROFIT_PCT - 0.01, days_to_expiry=10) is None
+
+
+def test_max_hold_fires_with_fewer_days_than_threshold():
+    assert decide_exit(unrealized_plpc=0.0, days_to_expiry=MAX_HOLD_DAYS_BEFORE_EXPIRY - 1) == ExitReason.MAX_HOLD
+
+
+def test_max_hold_does_not_fire_at_exactly_the_threshold():
+    # Boundary: exactly MAX_HOLD_DAYS_BEFORE_EXPIRY days left is still
+    # enough runway -- the condition is strictly "fewer than".
+    assert decide_exit(unrealized_plpc=0.0, days_to_expiry=MAX_HOLD_DAYS_BEFORE_EXPIRY) is None
+
+
+def test_neither_exit_fires_when_flat_and_far_from_expiry():
+    assert decide_exit(unrealized_plpc=0.1, days_to_expiry=10) is None
+
+
+def test_take_profit_takes_priority_over_max_hold_when_both_true():
+    result = decide_exit(unrealized_plpc=TAKE_PROFIT_PCT + 0.1, days_to_expiry=0)
+    assert result == ExitReason.TAKE_PROFIT
+
+
+def test_no_stop_loss_regardless_of_how_negative_unrealized_pl_is():
+    # The core guarantee this feature must not violate: a position stays
+    # open on a loss, no matter how large, as long as it isn't also
+    # within MAX_HOLD_DAYS_BEFORE_EXPIRY of expiring.
+    assert decide_exit(unrealized_plpc=-0.99, days_to_expiry=10) is None
+    assert decide_exit(unrealized_plpc=-0.01, days_to_expiry=10) is None
+
+
+# -- parse_occ_expiration() ---------------------------------------------------
+
+def test_parse_occ_expiration_valid_symbol():
+    assert parse_occ_expiration("NVDA260831C00222500") == date(2026, 8, 31)
+
+
+def test_parse_occ_expiration_invalid_symbol_returns_none():
+    assert parse_occ_expiration("not-an-option-symbol") is None
+
+
+# -- check_and_close_positions() / _close_position() live orchestration -----
+
+def _fake_position(
+    symbol, unrealized_plpc, side=PositionSide.LONG, qty="6",
+    asset_class=AssetClass.US_OPTION, unrealized_pl="120.0",
+):
+    return SimpleNamespace(
+        symbol=symbol, asset_class=asset_class, side=side, qty=qty,
+        unrealized_plpc=str(unrealized_plpc), unrealized_pl=unrealized_pl,
+    )
+
+
+def _executor_for_exit_tests(dry_run=True, exits_log_path=None, monkeypatch=None):
+    executor = OptionsExecutor(api_key="fake", secret_key="fake", dry_run=dry_run)
+    executor.trading_client.submit_order = Mock(return_value=SimpleNamespace(id="close-order-id"))
+    if exits_log_path is not None and monkeypatch is not None:
+        import agent.options_executor as oe_module
+        monkeypatch.setattr(oe_module, "EXITS_LOG_PATH", exits_log_path)
+    return executor
+
+
+def test_check_and_close_positions_closes_take_profit_position(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    today = date(2026, 8, 26)
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
+    executor.trading_client.get_all_positions = Mock(return_value=[position])
+    executor._latest_option_bid = Mock(return_value=3.50)
+
+    results = executor.check_and_close_positions(today=today)
+
+    assert len(results) == 1
+    assert results[0]["closed"] is True
+    assert results[0]["exit_reason"] == "take_profit"
+    executor.trading_client.submit_order.assert_called_once()
+    submitted = executor.trading_client.submit_order.call_args[0][0]
+    assert submitted.side == OrderSide.SELL
+    assert submitted.symbol == "NVDA260831C00222500"
+    assert submitted.qty == 6
+
+
+def test_check_and_close_positions_closes_max_hold_position(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    today = date(2026, 8, 30)  # symbol expires 2026-08-31 -> 1 day left, < MAX_HOLD_DAYS_BEFORE_EXPIRY (2)
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=0.0)
+    executor.trading_client.get_all_positions = Mock(return_value=[position])
+    executor._latest_option_bid = Mock(return_value=1.10)
+
+    results = executor.check_and_close_positions(today=today)
+
+    assert len(results) == 1
+    assert results[0]["closed"] is True
+    assert results[0]["exit_reason"] == "max_hold"
+    assert results[0]["days_to_expiry"] == 1
+    executor.trading_client.submit_order.assert_called_once()
+
+
+def test_check_and_close_positions_leaves_position_open_when_neither_condition_met(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    today = date(2026, 8, 26)  # expires 2026-08-31 -> 5 days left, plenty of runway
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=0.1)  # up 10%, below TAKE_PROFIT_PCT
+    executor.trading_client.get_all_positions = Mock(return_value=[position])
+    executor._latest_option_bid = Mock(return_value=2.50)
+
+    results = executor.check_and_close_positions(today=today)
+
+    assert results == []
+    executor.trading_client.submit_order.assert_not_called()
+
+
+def test_check_and_close_positions_never_fires_on_a_loss_alone(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    today = date(2026, 8, 26)  # 5 days to expiry, plenty of runway
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=-0.90)  # down 90%
+    executor.trading_client.get_all_positions = Mock(return_value=[position])
+    executor._latest_option_bid = Mock(return_value=0.25)
+
+    results = executor.check_and_close_positions(today=today)
+
+    assert results == []
+    executor.trading_client.submit_order.assert_not_called()
+
+
+def test_check_and_close_positions_skips_non_option_positions(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    equity_position = _fake_position("AAPL", unrealized_plpc=0.99, asset_class=AssetClass.US_EQUITY)
+    executor.trading_client.get_all_positions = Mock(return_value=[equity_position])
+
+    results = executor.check_and_close_positions(today=date(2026, 8, 26))
+
+    assert results == []
+    executor.trading_client.submit_order.assert_not_called()
+
+
+def test_close_position_refuses_short_positions(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=False, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    short_position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1, side=PositionSide.SHORT)
+    executor.trading_client.get_all_positions = Mock(return_value=[short_position])
+
+    results = executor.check_and_close_positions(today=date(2026, 8, 26))
+
+    assert len(results) == 1
+    assert results[0]["closed"] is False
+    assert "never opens short positions" in results[0]["detail"]
+    executor.trading_client.submit_order.assert_not_called()
+
+
+def test_dry_run_close_does_not_submit_order(monkeypatch, tmp_path):
+    executor = _executor_for_exit_tests(dry_run=True, exits_log_path=tmp_path / "exits.jsonl", monkeypatch=monkeypatch)
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
+    executor.trading_client.get_all_positions = Mock(return_value=[position])
+    executor._latest_option_bid = Mock(return_value=3.50)
+
+    results = executor.check_and_close_positions(today=date(2026, 8, 26))
+
+    assert len(results) == 1
+    assert results[0]["closed"] is False
+    assert results[0]["dry_run"] is True
+    assert results[0]["detail"].startswith("[DRY RUN]")
+    executor.trading_client.submit_order.assert_not_called()
+
+
+def test_close_detail_is_clearly_distinguishable_from_an_open():
+    # Regression guard for the exact concern raised: a close must never
+    # read like a new buy-to-open in the logs.
+    executor = OptionsExecutor(api_key="fake", secret_key="fake", dry_run=True)
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
+    executor._latest_option_bid = Mock(return_value=3.50)
+    executor._find_entry_reference = Mock(return_value=None)
+
+    record = executor._close_position(
+        position, ExitReason.TAKE_PROFIT, TAKE_PROFIT_PCT + 0.1, days_to_expiry=5, expiration=date(2026, 8, 31),
+    )
+
+    assert record["action"] == "close_position"
+    assert "SELL-TO-CLOSE" in record["detail"]
+    assert "BUY" not in record["detail"]

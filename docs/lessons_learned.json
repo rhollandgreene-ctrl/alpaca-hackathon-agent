@@ -46,5 +46,13 @@
     "title": "Position size vs. real option premiums",
     "summary": "Live verification showed the original per-trade budget frequently couldn't afford a single ATM contract at real SPY/NVDA premiums, let alone both legs of a straddle -- trades were silently sized to qty=0 and skipped. Increased the per-trade equity allocation and added an explicit _check_min_trade_budget gate that logs a distinct \"SKIPPED: ...\" message (not folded into a generic no-trade log) whenever a signal clears every eligibility/confidence/sentiment gate but can't be sized.",
     "impact": "Prevents the failure mode of 'the system went quiet' being ambiguous between 'nothing qualified' and 'something qualified but couldn't be sized' -- critical for reading the system correctly live during a demo."
+  },
+  {
+    "id": "exit-logic-take-profit-and-max-hold-only",
+    "date": "2026-08-28",
+    "component": "agent/options_executor.py",
+    "title": "Exit logic is take-profit and max-hold only -- deliberately no stop-loss",
+    "summary": "Before this, positions opened and simply sat until expiry with no automated exit at all. Added check_and_close_positions(), polled every cycle: closes a position once its unrealized gain reaches a configurable take-profit threshold, or once it's within a configurable number of days of expiring (to avoid pin risk/illiquidity right at expiration). Deliberately did NOT add a stop-loss or any loss-triggered exit. This is not an oversight: every position Daedalus opens is a bought (long) call, put, or straddle -- never written/sold -- so loss per trade is already bounded to the premium paid by construction. A stop-loss would realize that already-bounded loss early on paths that might otherwise recover, cutting into the exact convexity the premium bought.",
+    "impact": "Positions no longer ride to expiry unmanaged on the upside or the max-hold/pin-risk side, without introducing a loss-triggered exit that would work against the defined-risk, long-only design the entry side already guarantees."
   }
 ]
