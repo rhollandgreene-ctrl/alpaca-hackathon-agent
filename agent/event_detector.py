@@ -81,6 +81,11 @@ DEFAULT_WATCHLIST = [
 
 # Macro/economic event registry. `date` is a `datetime.date` or None
 # (unscheduled placeholder — fill in once the calendar is published).
+# event_type MUST be prefixed "macro_" -- options_executor.is_event_eligible()
+# routes macro-specific eligibility gating (cross-referencing this registry's
+# `date`) via event_type.startswith("macro_"); anything else falls through to
+# the always-eligible earnings_surprise-style branch, which would bypass
+# no-pre-event-bets entirely.
 MACRO_EVENTS = [
     {
         "name": "Jackson Hole Economic Symposium",
@@ -90,18 +95,34 @@ MACRO_EVENTS = [
         "search_query": "Jackson Hole Symposium Federal Reserve Powell speech",
     },
     {
+        "name": "August Jobs Report",
+        "event_type": "macro_jobs_report",
+        "date": date(2026, 9, 4),
+        "description": "Employment Situation report (nonfarm payrolls, unemployment rate)",
+        "search_query": "jobs report nonfarm payrolls unemployment rate",
+    },
+    {
+        "name": "CPI Release",
+        "event_type": "macro_cpi_release",
+        "date": date(2026, 9, 11),
+        "description": "Consumer Price Index inflation data release (August data)",
+        "search_query": "CPI inflation report release",
+    },
+    {
         "name": "FOMC Meeting",
-        "event_type": "macro_fomc",
-        "date": None,
+        "event_type": "macro_fomc_meeting",
+        # Decision/announcement date, not the meeting's start date -- that's
+        # when the market-moving rate decision actually lands.
+        "date": date(2026, 9, 16),
         "description": "Federal Open Market Committee interest rate decision",
         "search_query": "FOMC meeting interest rate decision outlook",
     },
     {
-        "name": "CPI Release",
-        "event_type": "macro_cpi",
-        "date": None,
-        "description": "Consumer Price Index inflation data release",
-        "search_query": "CPI inflation report release",
+        "name": "PCE Inflation Data",
+        "event_type": "macro_pce_data",
+        "date": date(2026, 9, 30),
+        "description": "Personal Consumption Expenditures price index release (Fed's preferred inflation gauge)",
+        "search_query": "PCE inflation data release Fed preferred inflation gauge",
     },
 ]
 

@@ -18,9 +18,10 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 from alpaca.trading.enums import AssetClass, OrderSide, PositionSide
 
-from agent.event_detector import Event
+from agent.event_detector import MACRO_EVENTS, Event
 from agent.options_executor import (
     DIRECTIONAL_SENTIMENT_THRESHOLD,
     MAX_HOLD_DAYS_BEFORE_EXPIRY,
@@ -104,6 +105,42 @@ def test_unknown_macro_event_type_is_not_eligible():
     event = make_event("macro_cpi", sentiment_score=0.9, confidence=0.9)
     decision = decide_trade_mode(event, macro_events=TEST_MACRO_EVENTS, today=date(2026, 8, 28))
     assert decision.mode == TradeMode.NO_TRADE
+
+
+# -- newly-added macro registry entries (jobs report, CPI, FOMC, PCE) -------
+# Against the REAL MACRO_EVENTS registry (not a local fixture), same as the
+# Jackson Hole eligibility tests above but verifying the actual configured
+# dates -- these route through is_event_eligible/decide_trade_mode exactly
+# like macro_jackson_hole; no new logic, only new registry entries.
+
+_NEW_MACRO_EVENTS = [
+    ("macro_jobs_report", date(2026, 9, 4)),
+    ("macro_cpi_release", date(2026, 9, 11)),
+    ("macro_fomc_meeting", date(2026, 9, 16)),
+    ("macro_pce_data", date(2026, 9, 30)),
+]
+
+
+@pytest.mark.parametrize("event_type,scheduled_date", _NEW_MACRO_EVENTS)
+def test_new_macro_event_registered_in_real_registry_with_correct_date(event_type, scheduled_date):
+    entry = next(m for m in MACRO_EVENTS if m["event_type"] == event_type)
+    assert entry["date"] == scheduled_date
+
+
+@pytest.mark.parametrize("event_type,scheduled_date", _NEW_MACRO_EVENTS)
+def test_new_macro_event_blocked_before_scheduled_date(event_type, scheduled_date):
+    event = make_event(event_type, sentiment_score=0.9, confidence=0.9)
+    day_before = date.fromordinal(scheduled_date.toordinal() - 1)
+    decision = decide_trade_mode(event, macro_events=MACRO_EVENTS, today=day_before)
+    assert decision.mode == TradeMode.NO_TRADE
+    assert "hasn't happened yet" in decision.reason
+
+
+@pytest.mark.parametrize("event_type,scheduled_date", _NEW_MACRO_EVENTS)
+def test_new_macro_event_eligible_on_scheduled_date(event_type, scheduled_date):
+    event = make_event(event_type, sentiment_score=0.9, confidence=0.9)
+    decision = decide_trade_mode(event, macro_events=MACRO_EVENTS, today=scheduled_date)
+    assert decision.mode == TradeMode.DIRECTIONAL_CALL
 
 
 # -- trade vs. no-trade, directional vs. straddle ----------------------------
