@@ -16,6 +16,10 @@ data/*.jsonl
 # DailyTradeGuard's persisted dedup snapshot — runtime state, not code.
 data/trade_guard_state.json
 
+# OpenPositionsIndex's persisted entry/exit pairing snapshot — runtime
+# state, not code.
+data/open_positions_index.json
+
 # Logs
 *.log
 

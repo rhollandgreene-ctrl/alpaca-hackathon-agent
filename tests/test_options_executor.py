@@ -31,6 +31,7 @@ from agent.options_executor import (
     TAKE_PROFIT_PCT,
     DailyTradeGuard,
     ExitReason,
+    OpenPositionsIndex,
     OptionsExecutor,
     TradeDecision,
     TradeMode,
@@ -467,6 +468,204 @@ def test_parse_occ_expiration_invalid_symbol_returns_none():
     assert parse_occ_expiration("not-an-option-symbol") is None
 
 
+# -- OpenPositionsIndex: reliable entry/exit pairing for the post-mortem ----
+# Replaces the old best-effort trades.jsonl scan, confirmed live to fail
+# 100% of the time in practice (0 of 3 real exits linked), because
+# logrotate rotates data/*.jsonl daily and the scan never looked past the
+# live file. This index is a plain .json file, immune to that rotation
+# by construction.
+
+def test_open_positions_index_records_and_peeks_entry(tmp_path):
+    index = OpenPositionsIndex(state_path=tmp_path / "index.json")
+    index.record_entry(
+        "NVDA260831C00222500", trade_id="trade-a", order_id="order-a",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    entries = index.peek_entries("NVDA260831C00222500")
+    assert entries is not None
+    assert len(entries) == 1
+    assert entries[0]["trade_id"] == "trade-a"
+    assert entries[0]["order_id"] == "order-a"
+    assert entries[0]["event_type"] == "earnings_surprise"
+    assert entries[0]["ticker"] == "NVDA"
+
+
+def test_open_positions_index_peek_does_not_remove(tmp_path):
+    index = OpenPositionsIndex(state_path=tmp_path / "index.json")
+    index.record_entry(
+        "NVDA260831C00222500", trade_id="trade-a", order_id="order-a",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    index.peek_entries("NVDA260831C00222500")
+    assert index.peek_entries("NVDA260831C00222500") is not None  # still there — peek must not consume
+
+
+def test_open_positions_index_remove_entries_clears_the_symbol(tmp_path):
+    index = OpenPositionsIndex(state_path=tmp_path / "index.json")
+    index.record_entry(
+        "NVDA260831C00222500", trade_id="trade-a", order_id="order-a",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    index.remove_entries("NVDA260831C00222500")
+
+    assert index.peek_entries("NVDA260831C00222500") is None
+
+
+def test_open_positions_index_survives_a_simulated_restart(tmp_path):
+    state_path = tmp_path / "index.json"
+    index_before_restart = OpenPositionsIndex(state_path=state_path)
+    index_before_restart.record_entry(
+        "NVDA260831C00222500", trade_id="trade-a", order_id="order-a",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    # Simulate a process restart: a brand new instance, no shared memory
+    # with the one above -- only the state file connects them.
+    index_after_restart = OpenPositionsIndex(state_path=state_path)
+    entries = index_after_restart.peek_entries("NVDA260831C00222500")
+
+    assert entries is not None
+    assert entries[0]["trade_id"] == "trade-a"
+
+
+def test_open_positions_index_resolves_two_entries_on_same_symbol_without_collision(tmp_path):
+    # The exact ambiguity case: the same contract symbol bought twice on
+    # different days (Alpaca merges same-symbol buys into one combined
+    # position). Both entries must survive with their own trade_id --
+    # neither should silently overwrite the other.
+    state_path = tmp_path / "index.json"
+    index_day1 = OpenPositionsIndex(state_path=state_path)
+    index_day1.record_entry(
+        "NVDA260831C00222500", trade_id="trade-day1", order_id="order-day1",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    # Simulate a restart the next day, then a second entry on the same symbol.
+    index_day2 = OpenPositionsIndex(state_path=state_path)
+    index_day2.record_entry(
+        "NVDA260831C00222500", trade_id="trade-day2", order_id="order-day2",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+
+    entries = index_day2.peek_entries("NVDA260831C00222500")
+    assert entries is not None
+    assert len(entries) == 2
+    assert {e["trade_id"] for e in entries} == {"trade-day1", "trade-day2"}
+
+    # Closing removes both at once -- Alpaca closes them as one combined position.
+    index_day2.remove_entries("NVDA260831C00222500")
+    assert index_day2.peek_entries("NVDA260831C00222500") is None
+
+
+# -- OpenPositionsIndex wired into execute_directional/_close_position ------
+
+def test_execute_directional_records_entry_in_position_index(tmp_path):
+    executor = OptionsExecutor(
+        api_key="fake", secret_key="fake", dry_run=False,
+        position_index_path=tmp_path / "index.json",
+    )
+    executor.get_equity = Mock(return_value=100_000.0)
+    executor._spot_price = Mock(return_value=200.0)
+    executor.select_contract = Mock(return_value=_fake_contract("NVDA260831C00200000"))
+    executor._latest_option_ask = Mock(return_value=2.0)
+    executor.trading_client.submit_order = Mock(return_value=SimpleNamespace(id="entry-order-id"))
+
+    event = make_event("earnings_surprise", ticker="NVDA", sentiment_score=0.6, confidence=0.8)
+    decision = TradeDecision(TradeMode.DIRECTIONAL_CALL, "cleared all gates")
+
+    result = executor.execute_directional(event, decision, today=date(2026, 8, 26))
+
+    assert result.traded is True
+    trade_id = result.extra["trade_id"]
+    assert trade_id
+
+    entries = executor.position_index.peek_entries("NVDA260831C00200000")
+    assert entries is not None
+    assert entries[0]["trade_id"] == trade_id
+    assert entries[0]["order_id"] == "entry-order-id"
+    assert entries[0]["event_type"] == "earnings_surprise"
+    assert entries[0]["ticker"] == "NVDA"
+
+
+def test_dry_run_entry_does_not_populate_position_index(tmp_path):
+    # A dry-run entry never opens a real position, so it must not create
+    # an index entry that a real close could later (incorrectly) consume.
+    executor = OptionsExecutor(
+        api_key="fake", secret_key="fake", dry_run=True,
+        position_index_path=tmp_path / "index.json",
+    )
+    executor.get_equity = Mock(return_value=100_000.0)
+    executor._spot_price = Mock(return_value=200.0)
+    executor.select_contract = Mock(return_value=_fake_contract("NVDA260831C00200000"))
+    executor._latest_option_ask = Mock(return_value=2.0)
+
+    event = make_event("earnings_surprise", ticker="NVDA", sentiment_score=0.6, confidence=0.8)
+    decision = TradeDecision(TradeMode.DIRECTIONAL_CALL, "cleared all gates")
+
+    result = executor.execute_directional(event, decision, today=date(2026, 8, 26))
+
+    assert result.traded is False
+    assert result.extra["trade_id"]  # still stamped, for the audit trail
+    assert executor.position_index.peek_entries("NVDA260831C00200000") is None
+
+
+def test_close_position_consumes_and_clears_index_entry(monkeypatch, tmp_path):
+    import agent.options_executor as oe_module
+    monkeypatch.setattr(oe_module, "EXITS_LOG_PATH", tmp_path / "exits.jsonl")
+
+    executor = OptionsExecutor(
+        api_key="fake", secret_key="fake", dry_run=False,
+        position_index_path=tmp_path / "index.json",
+    )
+    executor.position_index.record_entry(
+        "NVDA260831C00222500", trade_id="trade-abc", order_id="order-abc",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+    executor._latest_option_bid = Mock(return_value=3.50)
+    executor.trading_client.submit_order = Mock(return_value=SimpleNamespace(id="close-order-id"))
+
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
+    record = executor._close_position(
+        position, ExitReason.TAKE_PROFIT, TAKE_PROFIT_PCT + 0.1, days_to_expiry=5, expiration=date(2026, 8, 31),
+    )
+
+    assert record["closed"] is True
+    assert record["entry_reference"] is not None
+    assert record["entry_reference"][0]["trade_id"] == "trade-abc"
+
+    # Cleared after a real close -- the position is genuinely gone.
+    assert executor.position_index.peek_entries("NVDA260831C00222500") is None
+
+
+def test_skipped_close_does_not_clear_index_entry(monkeypatch, tmp_path):
+    # A close attempt that doesn't actually execute (no live bid quote)
+    # must not lose the index entry -- the position is still open and
+    # needs to resolve correctly on the next poll.
+    import agent.options_executor as oe_module
+    monkeypatch.setattr(oe_module, "EXITS_LOG_PATH", tmp_path / "exits.jsonl")
+
+    executor = OptionsExecutor(
+        api_key="fake", secret_key="fake", dry_run=False,
+        position_index_path=tmp_path / "index.json",
+    )
+    executor.position_index.record_entry(
+        "NVDA260831C00222500", trade_id="trade-abc", order_id="order-abc",
+        event_type="earnings_surprise", ticker="NVDA",
+    )
+    executor._latest_option_bid = Mock(return_value=None)  # no live quote
+
+    position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
+    record = executor._close_position(
+        position, ExitReason.TAKE_PROFIT, TAKE_PROFIT_PCT + 0.1, days_to_expiry=5, expiration=date(2026, 8, 31),
+    )
+
+    assert record["closed"] is False
+    assert executor.position_index.peek_entries("NVDA260831C00222500") is not None
+
+
 # -- check_and_close_positions() / _close_position() live orchestration -----
 
 def _fake_position(
@@ -588,10 +787,13 @@ def test_dry_run_close_does_not_submit_order(monkeypatch, tmp_path):
     executor.trading_client.submit_order.assert_not_called()
 
 
-def test_close_detail_is_clearly_distinguishable_from_an_open():
+def test_close_detail_is_clearly_distinguishable_from_an_open(monkeypatch, tmp_path):
     # Regression guard for the exact concern raised: a close must never
     # read like a new buy-to-open in the logs.
-    executor = OptionsExecutor(api_key="fake", secret_key="fake", dry_run=True)
+    import agent.options_executor as oe_module
+    monkeypatch.setattr(oe_module, "EXITS_LOG_PATH", tmp_path / "exits.jsonl")
+
+    executor = OptionsExecutor(api_key="fake", secret_key="fake", dry_run=True, position_index_path=tmp_path / "index.json")
     position = _fake_position("NVDA260831C00222500", unrealized_plpc=TAKE_PROFIT_PCT + 0.1)
     executor._latest_option_bid = Mock(return_value=3.50)
     executor._find_entry_reference = Mock(return_value=None)

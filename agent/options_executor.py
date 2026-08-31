@@ -54,6 +54,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -103,31 +104,19 @@ EXITS_LOG_PATH = REPO_ROOT / "data" / "exits.jsonl"
 # entry on 2026-08-28).
 GUARD_STATE_PATH = REPO_ROOT / "data" / "trade_guard_state.json"
 
+# OpenPositionsIndex's persisted symbol -> [entry, ...] snapshot. See
+# OpenPositionsIndex for why this exists: a plain trades.jsonl scan for
+# entry/exit pairing is unreliable in practice -- confirmed live, 0 of 3
+# real exits linked, because /etc/logrotate.d/daedalus rotates
+# data/*.jsonl daily and the scan never looks past the live file. Plain
+# .json, not .jsonl, so that glob never touches it.
+OPEN_POSITIONS_INDEX_PATH = REPO_ROOT / "data" / "open_positions_index.json"
+
 
 def _append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
-
-
-def _read_jsonl(path: Path) -> list[dict]:
-    """Local, minimal JSONL reader — deliberately not shared with
-    mcp_server/logic.py's read_jsonl to avoid agent/ depending on
-    mcp_server/ (wrong layering direction); same no-database tradeoff as
-    _append_jsonl above."""
-    if not path.exists():
-        return []
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return records
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +305,81 @@ def parse_occ_expiration(symbol: str) -> Optional[date]:
 
 
 # ---------------------------------------------------------------------------
+# Open-positions index: reliable entry/exit pairing for the post-mortem.
+
+class OpenPositionsIndex:
+    """Tracks which trade(s) opened each currently-open contract symbol.
+
+    Replaces a plain trades.jsonl scan, which was unreliable in practice:
+    confirmed live, 0 of 3 real exits successfully linked back to their
+    entry, because /etc/logrotate.d/daedalus rotates data/*.jsonl daily
+    and the scan only ever looked at the live file — anything from a
+    prior rotation (i.e. most positions, since they're typically held
+    multiple days) was invisible. This index is immune to that by
+    construction: it's a plain .json file (not .jsonl), so logrotate's
+    glob never touches it.
+
+    It's also unambiguous when the same contract symbol is bought more
+    than once — Alpaca merges same-symbol buys into a single position,
+    so this keeps every contributing entry as a list under that symbol,
+    rather than letting a later entry silently overwrite an earlier one.
+
+    Persisted to state_path, load-on-init/save-on-write — same pattern
+    as DailyTradeGuard.
+    """
+
+    def __init__(self, state_path: Path = OPEN_POSITIONS_INDEX_PATH):
+        self.state_path = state_path
+        self._entries: dict[str, list[dict]] = self._load()
+
+    def _load(self) -> dict[str, list[dict]]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            with self.state_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read open positions index from %s — starting empty", self.state_path)
+            return {}
+
+    def _save(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.state_path.open("w", encoding="utf-8") as f:
+            json.dump(self._entries, f)
+
+    def record_entry(
+        self, contract_symbol: str, trade_id: str, order_id: Optional[str],
+        event_type: str, ticker: Optional[str],
+    ) -> None:
+        """Called only once a real order has actually been submitted —
+        never for a dry-run or budget-skipped attempt, since no position
+        exists yet to track in either case."""
+        self._entries.setdefault(contract_symbol, []).append({
+            "trade_id": trade_id,
+            "order_id": order_id,
+            "event_type": event_type,
+            "ticker": ticker,
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        })
+        self._save()
+
+    def peek_entries(self, contract_symbol: str) -> Optional[list[dict]]:
+        """Read without removing — used to populate entry_reference on
+        every close attempt (including a skipped or dry-run one, which
+        must not lose its index entry since the position is still open)."""
+        entries = self._entries.get(contract_symbol)
+        return list(entries) if entries else None
+
+    def remove_entries(self, contract_symbol: str) -> None:
+        """Called only once a real close order has actually been
+        submitted — the position is genuinely gone, so its entry history
+        is cleared."""
+        if contract_symbol in self._entries:
+            del self._entries[contract_symbol]
+            self._save()
+
+
+# ---------------------------------------------------------------------------
 # Live execution layer
 
 class OptionsExecutor:
@@ -324,10 +388,12 @@ class OptionsExecutor:
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
         dry_run: bool = False,
+        position_index_path: Path = OPEN_POSITIONS_INDEX_PATH,
     ):
         api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
         secret_key = secret_key if secret_key is not None else os.getenv("ALPACA_SECRET_KEY")
         self.dry_run = dry_run
+        self.position_index = OpenPositionsIndex(state_path=position_index_path)
 
         if TradingClient is None:
             raise RuntimeError("alpaca-py is not installed — add it to requirements.txt")
@@ -504,6 +570,12 @@ class OptionsExecutor:
             logger.warning(budget_message)
             return ExecutionResult(event, decision, False, budget_message, dry_run=self.dry_run, extra=sizing_extra)
 
+        # Generated here, not earlier -- only an actually-attempted order
+        # (dry-run or live) gets a trade_id; a budget-skipped signal never
+        # opens a position, so there's nothing for an index entry to track.
+        trade_id = uuid.uuid4().hex[:12]
+        order_sizing_extra = {**sizing_extra, "trade_id": trade_id}
+
         order_request = LimitOrderRequest(
             symbol=contract.symbol,
             qty=qty,
@@ -516,16 +588,20 @@ class OptionsExecutor:
             f"BUY {qty}x {contract.symbol} ({option_type.value}, strike={contract.strike_price}, "
             f"exp={contract.expiration_date}) @ limit ${ask:.2f} | event={event.event_type} "
             f"ticker={ticker}{proxy_note} sentiment={event.sentiment_score} confidence={event.confidence} "
-            f"| reason: {decision.reason}"
+            f"| reason: {decision.reason} | trade_id={trade_id}"
         )
 
         if self.dry_run:
             logger.info("[DRY RUN] Would place order: %s", detail)
-            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=sizing_extra)
+            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=order_sizing_extra)
 
         order = self.trading_client.submit_order(order_request)
+        self.position_index.record_entry(
+            contract.symbol, trade_id=trade_id, order_id=str(order.id),
+            event_type=event.event_type, ticker=event.ticker,
+        )
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=sizing_extra)
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=order_sizing_extra)
 
     def execute_straddle(self, event: Event, decision: TradeDecision, today: date) -> ExecutionResult:
         ticker, proxy_note = self._resolve_ticker(event)
@@ -581,6 +657,12 @@ class OptionsExecutor:
             logger.warning(budget_message)
             return ExecutionResult(event, decision, False, budget_message, dry_run=self.dry_run, extra=sizing_extra)
 
+        # Both legs share one trade_id -- they're one straddle trade from
+        # one entry decision, even though they're two separate Alpaca
+        # positions (different symbols) that close independently.
+        trade_id = uuid.uuid4().hex[:12]
+        order_sizing_extra = {**sizing_extra, "trade_id": trade_id}
+
         legs = [
             OptionLegRequest(symbol=call_contract.symbol, ratio_qty=1, side=OrderSide.BUY),
             OptionLegRequest(symbol=put_contract.symbol, ratio_qty=1, side=OrderSide.BUY),
@@ -596,16 +678,25 @@ class OptionsExecutor:
         detail = (
             f"BUY {qty}x STRADDLE {ticker}{proxy_note}: call={call_contract.symbol} put={put_contract.symbol} "
             f"@ combined limit ${combined_ask:.2f} (underlying moved {move_pct}%) | event={event.event_type} "
-            f"sentiment={event.sentiment_score} confidence={event.confidence} | reason: {decision.reason}"
+            f"sentiment={event.sentiment_score} confidence={event.confidence} | reason: {decision.reason} "
+            f"| trade_id={trade_id}"
         )
 
         if self.dry_run:
             logger.info("[DRY RUN] Would place order: %s", detail)
-            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=sizing_extra)
+            return ExecutionResult(event, decision, False, f"[DRY RUN] {detail}", dry_run=True, extra=order_sizing_extra)
 
         order = self.trading_client.submit_order(order_request)
+        self.position_index.record_entry(
+            call_contract.symbol, trade_id=trade_id, order_id=str(order.id),
+            event_type=event.event_type, ticker=event.ticker,
+        )
+        self.position_index.record_entry(
+            put_contract.symbol, trade_id=trade_id, order_id=str(order.id),
+            event_type=event.event_type, ticker=event.ticker,
+        )
         logger.info("Order submitted: %s | order_id=%s", detail, order.id)
-        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=sizing_extra)
+        return ExecutionResult(event, decision, True, detail, order_id=str(order.id), dry_run=self.dry_run, extra=order_sizing_extra)
 
     def execute_event(self, event: Event, macro_events: list[dict] = MACRO_EVENTS, today: Optional[date] = None) -> ExecutionResult:
         today = today if today is not None else datetime.now(timezone.utc).date()
@@ -670,25 +761,16 @@ class OptionsExecutor:
 
         return results
 
-    def _find_entry_reference(self, contract_symbol: str) -> Optional[dict]:
-        """Best-effort cross-reference to the trades.jsonl record that
-        opened this contract symbol, for context in the exit log — not
-        authoritative, just a convenience. None is a normal, expected
-        result if the entry predates this feature or isn't found."""
-        for record in reversed(_read_jsonl(TRADES_LOG_PATH)):
-            extra = record.get("extra") or {}
-            if contract_symbol in (
-                extra.get("contract_symbol"),
-                extra.get("call_contract_symbol"),
-                extra.get("put_contract_symbol"),
-            ):
-                event = record.get("event") or {}
-                return {
-                    "event_type": event.get("event_type"),
-                    "ticker": event.get("ticker"),
-                    "order_id": record.get("order_id"),
-                }
-        return None
+    def _find_entry_reference(self, contract_symbol: str) -> Optional[list[dict]]:
+        """Looks up OpenPositionsIndex (not a trades.jsonl scan) for every
+        entry that opened this contract symbol. Immune to trades.jsonl's
+        daily log rotation by construction, and returns every
+        contributing entry as a list — normally length 1, but a list so
+        two separate entries on the same symbol (Alpaca merges them into
+        one position) don't silently collide into a single reference.
+        Read-only: does not remove anything from the index — see
+        OpenPositionsIndex.peek_entries / remove_entries."""
+        return self.position_index.peek_entries(contract_symbol)
 
     def _close_position(
         self, position, reason: ExitReason, unrealized_plpc: float,
@@ -766,6 +848,11 @@ class OptionsExecutor:
             return record
 
         order = self.trading_client.submit_order(order_request)
+        # Only removed here, on a real submitted close -- a skipped or
+        # dry-run close attempt above must not clear the index, since the
+        # position is still genuinely open and needs to resolve again on
+        # the next poll.
+        self.position_index.remove_entries(position.symbol)
         logger.info("Position CLOSE submitted (sell-to-close): %s | order_id=%s", detail, order.id)
         record = {
             **base_record, "closed": True, "qty": qty, "limit_price": round(bid, 2),
