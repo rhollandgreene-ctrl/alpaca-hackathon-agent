@@ -119,6 +119,8 @@ _NEW_MACRO_EVENTS = [
     ("macro_cpi_release", date(2026, 9, 11)),
     ("macro_fomc_meeting", date(2026, 9, 16)),
     ("macro_pce_data", date(2026, 9, 30)),
+    ("macro_fomc_meeting_oct", date(2026, 10, 28)),
+    ("macro_fomc_meeting_dec", date(2026, 12, 9)),
 ]
 
 

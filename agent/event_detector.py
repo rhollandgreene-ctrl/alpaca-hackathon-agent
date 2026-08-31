@@ -124,6 +124,22 @@ MACRO_EVENTS = [
         "description": "Personal Consumption Expenditures price index release (Fed's preferred inflation gauge)",
         "search_query": "PCE inflation data release Fed preferred inflation gauge",
     },
+    {
+        "name": "FOMC Meeting (October)",
+        "event_type": "macro_fomc_meeting_oct",
+        # Decision/announcement date, not the meeting's start date -- see
+        # macro_fomc_meeting above for why.
+        "date": date(2026, 10, 28),
+        "description": "Federal Open Market Committee interest rate decision",
+        "search_query": "FOMC meeting interest rate decision outlook",
+    },
+    {
+        "name": "FOMC Meeting (December)",
+        "event_type": "macro_fomc_meeting_dec",
+        "date": date(2026, 12, 9),
+        "description": "Federal Open Market Committee interest rate decision",
+        "search_query": "FOMC meeting interest rate decision outlook",
+    },
 ]
 
 
