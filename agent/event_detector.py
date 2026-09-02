@@ -71,6 +71,26 @@ def _append_jsonl(path: Path, record: dict) -> None:
 # ---------------------------------------------------------------------------
 # Config
 
+# -- earnings-date instability recovery (see check_earnings/_check_earnings_
+# date_stability). Confirmed live 2026-09-02: get_earnings_dates() dropped
+# rows for 6 tickers with real, sometimes large, earnings surprises (NIO
+# +107%) mid-poll; independent checks minutes to ~30 min later showed the
+# rows had come back on their own. These two knobs give recovery a chance
+# within a single poll cycle before falling through to the calendar-only
+# fallback, which can't carry a real EPS surprise.
+EARNINGS_FETCH_RETRY_ATTEMPTS = 3
+EARNINGS_FETCH_RETRY_BACKOFF_SECONDS = 3
+# yfinance's get_earnings_dates(limit=N) internally buckets N into a
+# Yahoo page-size request of 25/50/100 -- any limit <= 25 requests the
+# same 25-row page regardless of the exact number (confirmed: limit=8 and
+# limit=20 return identical rows). Only crossing a bucket boundary (>25,
+# >50) produces a genuinely different, larger request. 60 crosses into
+# the size=100 bucket -- the largest page available, and a differently-
+# shaped request against Yahoo's live-scraped (and observed flaky) page
+# than the default limit=8 call, worth trying as an independent second
+# attempt rather than a literal "read further down the same page."
+EARNINGS_DEEPER_LOOKBACK_LIMIT = 60
+
 DEFAULT_WATCHLIST = [
     "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "DELL", "PANW", "MDT", "MDB", "NIO",
     "GTLB", "AVGO", "SNOW", "HPE", "NTAP", "FIVE", "AVAV", "OLLI", "PVH", "AI",
@@ -429,6 +449,44 @@ class EventDetector:
 
     # -- earnings ------------------------------------------------------------
 
+    def _fetch_ticker_earnings(
+        self, ticker: str, today: date, now: datetime, limit: int = 8,
+    ) -> tuple[list[date], list[Event]]:
+        """One get_earnings_dates() fetch + parse for a single ticker,
+        split out of check_earnings() so it can be re-invoked in place
+        (same-cycle retry, deeper-lookback recovery) without duplicating
+        the parsing logic. Returns (active_dates, events_for_this_ticker).
+        """
+        try:
+            edf = yf.Ticker(ticker).get_earnings_dates(limit=limit)
+        except Exception:
+            # Caught here so one ticker's scrape failure (observed live: a
+            # KeyError from yfinance's own HTML parsing) doesn't abort the
+            # whole watchlist pass -- edf falls through as None so this
+            # ticker still reaches _check_earnings_date_stability's
+            # recovery path instead of being skipped bare.
+            logger.warning("yfinance earnings lookup failed for %s", ticker, exc_info=True)
+            edf = None
+
+        active_dates: list[date] = []
+        ticker_events: list[Event] = []
+
+        if edf is not None and not edf.empty:
+            for idx, row in edf.iterrows():
+                edate = idx.date() if hasattr(idx, "date") else idx
+                delta_days = (edate - today).days
+                reported_eps = row.get("Reported EPS")
+                surprise_pct = row.get("Surprise(%)")
+
+                if reported_eps is not None and _not_nan(reported_eps) and 0 <= (today - edate).days <= self.earnings_lookback_days:
+                    ticker_events.append(self._build_earnings_event(ticker, edate, "earnings_surprise", surprise_pct, now))
+                    active_dates.append(edate)
+                elif 0 <= delta_days <= self.earnings_lookahead_days:
+                    ticker_events.append(self._build_earnings_event(ticker, edate, "earnings_upcoming", None, now))
+                    active_dates.append(edate)
+
+        return active_dates, ticker_events
+
     def check_earnings(self, now: Optional[datetime] = None) -> list[Event]:
         if yf is None:
             logger.warning("yfinance not installed — skipping earnings detection")
@@ -439,62 +497,65 @@ class EventDetector:
         events: list[Event] = []
 
         for ticker in self.watchlist:
-            try:
-                edf = yf.Ticker(ticker).get_earnings_dates(limit=8)
-            except Exception:
-                # Caught here so one ticker's scrape failure (observed live:
-                # a KeyError from yfinance's own HTML parsing) doesn't abort
-                # the whole watchlist pass -- but edf falls through as None
-                # rather than `continue`-ing past it, so this ticker still
-                # reaches _check_earnings_date_stability below and gets the
-                # same calendar cross-check/synthesis safety net as a
-                # silently-empty result, instead of being skipped bare.
-                logger.warning("yfinance earnings lookup failed for %s", ticker, exc_info=True)
-                edf = None
+            active_dates, ticker_events = self._fetch_ticker_earnings(ticker, today, now)
 
-            active_dates: list[date] = []
+            prior_date = self._last_earnings_date_seen.get(ticker)
+            if prior_date is not None and prior_date not in active_dates:
+                # Same-cycle retry for a transient miss: get_earnings_dates()
+                # is a live HTML scrape and can drop a row on one fetch and
+                # return it again moments later (observed live 2026-09-02:
+                # PANW/MDT/MDB/NIO/GTLB/DELL all recovered on their own
+                # within roughly 15-35 minutes). A few short-backoff retries
+                # in-cycle catch the fast end of that; anything slower falls
+                # through to _check_earnings_date_stability's calendar/deep-
+                # lookback recovery below, which the next poll (30 min
+                # later, same _last_earnings_date_seen memory) also gets a
+                # shot at regardless.
+                for attempt in range(1, EARNINGS_FETCH_RETRY_ATTEMPTS + 1):
+                    time.sleep(EARNINGS_FETCH_RETRY_BACKOFF_SECONDS)
+                    active_dates, ticker_events = self._fetch_ticker_earnings(ticker, today, now)
+                    if prior_date in active_dates:
+                        logger.info(
+                            "%s: get_earnings_dates() recovered previously-active date %s "
+                            "on in-cycle retry attempt %d/%d",
+                            ticker, prior_date.isoformat(), attempt, EARNINGS_FETCH_RETRY_ATTEMPTS,
+                        )
+                        break
 
-            if edf is not None and not edf.empty:
-                for idx, row in edf.iterrows():
-                    edate = idx.date() if hasattr(idx, "date") else idx
-                    delta_days = (edate - today).days
-                    reported_eps = row.get("Reported EPS")
-                    surprise_pct = row.get("Surprise(%)")
+            events.extend(ticker_events)
 
-                    if reported_eps is not None and _not_nan(reported_eps) and 0 <= (today - edate).days <= self.earnings_lookback_days:
-                        events.append(self._build_earnings_event(ticker, edate, "earnings_surprise", surprise_pct, now))
-                        active_dates.append(edate)
-                    elif 0 <= delta_days <= self.earnings_lookahead_days:
-                        events.append(self._build_earnings_event(ticker, edate, "earnings_upcoming", None, now))
-                        active_dates.append(edate)
-
-            synthesized_date = self._check_earnings_date_stability(ticker, today, active_dates)
-            if synthesized_date is not None:
-                # calendar confirms an imminent date but carries no Reported
-                # EPS/surprise data, so the only event we can honestly
-                # synthesize from it is earnings_upcoming.
-                events.append(self._build_earnings_event(ticker, synthesized_date, "earnings_upcoming", None, now))
+            synthesized = self._check_earnings_date_stability(ticker, today, active_dates)
+            if synthesized is not None:
+                event_type, edate, surprise_pct = synthesized
+                events.append(self._build_earnings_event(ticker, edate, event_type, surprise_pct, now))
 
         return events
 
     def _check_earnings_date_stability(
         self, ticker: str, today: date, active_dates: list[date]
-    ) -> Optional[date]:
+    ) -> Optional[tuple[str, date, Optional[float]]]:
         """Cross-check get_earnings_dates() against the more stable `calendar`
-        endpoint and this instance's own poll history, and log loudly on any
-        mismatch instead of failing silently.
+        endpoint, a deeper/differently-sized get_earnings_dates() request,
+        and this instance's own poll history — logging loudly on any
+        mismatch instead of failing silently. Only reached after
+        check_earnings()'s own same-cycle retry has already given up.
 
         get_earnings_dates() scrapes Yahoo's live earnings-calendar HTML page
         (see yfinance's own _get_earnings_dates_using_scrape) rather than
         calling a stable structured API, and can silently drop or shift a
         row between calls. `calendar` is a separate, less detailed (no
-        Reported EPS/surprise) but more stable endpoint that held steady
-        through the exact window get_earnings_dates() dropped a ticker's row
-        entirely.
+        Reported EPS/surprise) endpoint that's usually more stable, but can
+        itself roll forward to a next-quarter placeholder once a report is
+        far enough past — at which point neither source directly confirms
+        the still-in-window prior report, so this falls back further to a
+        deeper/differently-sized get_earnings_dates() request and, as a
+        last resort, a quarterly-financials cross-check.
 
-        Returns a calendar-confirmed date to synthesize an earnings_upcoming
-        event from, if get_earnings_dates() dropped a date that calendar
-        still confirms is imminent — otherwise None.
+        Returns (event_type, date, surprise_pct) to synthesize an event
+        from, or None if nothing recovers it. event_type is
+        "earnings_surprise" when real reported data was recovered (or
+        independently confirmed), "earnings_upcoming" when only calendar
+        confirms an imminent/recent date with no reported data available.
         """
         prior_date = self._last_earnings_date_seen.get(ticker)
         current_date = active_dates[0] if active_dates else None
@@ -503,9 +564,9 @@ class EventDetector:
             if current_date is None:
                 logger.warning(
                     "EARNINGS DATE INSTABILITY: %s had an active earnings date "
-                    "%s from get_earnings_dates() on a prior poll; it is now "
-                    "MISSING entirely from get_earnings_dates() — cross-checking "
-                    "the calendar endpoint",
+                    "%s from get_earnings_dates() on a prior poll; it is still "
+                    "MISSING after in-cycle retries — cross-checking the "
+                    "calendar endpoint",
                     ticker, prior_date.isoformat(),
                 )
             else:
@@ -520,7 +581,7 @@ class EventDetector:
             return None
 
         # get_earnings_dates() has no active row for this ticker this poll.
-        # Only bother cross-checking calendar (an extra network call) when we
+        # Only bother cross-checking (each an extra network call) when we
         # have prior-poll evidence this ticker was actually in play — avoids
         # doubling yfinance calls for the ~48 watchlist tickers that were
         # never active in the first place.
@@ -528,24 +589,58 @@ class EventDetector:
             return None
 
         calendar_date = self._get_calendar_earnings_date(ticker)
-        if calendar_date is None:
-            return None
-
-        in_window = (
+        calendar_in_window = calendar_date is not None and (
             0 <= (calendar_date - today).days <= self.earnings_lookahead_days
             or 0 <= (today - calendar_date).days <= self.earnings_lookback_days
         )
-        if not in_window:
+        if calendar_in_window:
+            logger.warning(
+                "%s: get_earnings_dates() dropped the row but calendar confirms "
+                "earnings on %s — synthesizing earnings_upcoming from calendar so "
+                "this ticker isn't silently lost from detection",
+                ticker, calendar_date.isoformat(),
+            )
+            self._last_earnings_date_seen[ticker] = calendar_date
+            return ("earnings_upcoming", calendar_date, None)
+
+        # Calendar has also moved on (e.g. to a next-quarter placeholder) --
+        # a DELL-style loss that looks permanent on both live sources. Only
+        # worth digging further if prior_date's own earnings_surprise
+        # window (report already happened, within lookback) is still open.
+        if not (0 <= (today - prior_date).days <= self.earnings_lookback_days):
             return None
 
-        logger.warning(
-            "%s: get_earnings_dates() dropped the row but calendar confirms "
-            "earnings on %s — synthesizing earnings_upcoming from calendar so "
-            "this ticker isn't silently lost from detection",
-            ticker, calendar_date.isoformat(),
+        deep_result = self._deep_fetch_earnings_row(ticker, prior_date)
+        if deep_result is not None:
+            reported_eps, surprise_pct = deep_result
+            logger.warning(
+                "%s: recovered earnings_surprise for %s via a deeper "
+                "get_earnings_dates() request (limit=%d) after both "
+                "get_earnings_dates() and calendar had lost it",
+                ticker, prior_date.isoformat(), EARNINGS_DEEPER_LOOKBACK_LIMIT,
+            )
+            self._last_earnings_date_seen[ticker] = prior_date
+            return ("earnings_surprise", prior_date, surprise_pct)
+
+        if self._confirm_report_via_financials(ticker, prior_date):
+            logger.warning(
+                "%s: get_earnings_dates() and calendar both lost the %s report "
+                "and the deeper lookback found no EPS row, but quarterly "
+                "financials confirm a matching quarter was posted -- "
+                "synthesizing earnings_surprise with surprise_pct unavailable",
+                ticker, prior_date.isoformat(),
+            )
+            self._last_earnings_date_seen[ticker] = prior_date
+            return ("earnings_surprise", prior_date, None)
+
+        logger.error(
+            "%s: earnings report on %s appears unrecoverable this poll -- "
+            "get_earnings_dates() (including a deeper request), calendar, "
+            "and the quarterly-financials cross-check all failed to confirm "
+            "it. Will retry from scratch next poll.",
+            ticker, prior_date.isoformat(),
         )
-        self._last_earnings_date_seen[ticker] = calendar_date
-        return calendar_date
+        return None
 
     def _get_calendar_earnings_date(self, ticker: str) -> Optional[date]:
         """Cross-check source for _check_earnings_date_stability — a separate
@@ -562,6 +657,68 @@ class EventDetector:
         if not dates:
             return None
         return dates[0]
+
+    def _deep_fetch_earnings_row(self, ticker: str, target_date: date) -> Optional[tuple]:
+        """Second recovery attempt for a row that's vanished from both
+        get_earnings_dates() and calendar: request get_earnings_dates()
+        again at EARNINGS_DEEPER_LOOKBACK_LIMIT. This isn't "reading
+        further down the same page" -- yfinance buckets any limit<=25 into
+        an identical 25-row Yahoo request (confirmed empirically), so a
+        limit past that bucket boundary is a genuinely different, larger
+        request that may hit different upstream caching/rendering and by
+        chance include the row a smaller request dropped.
+
+        Returns (reported_eps, surprise_pct) if target_date is found with
+        real reported data, else None.
+        """
+        try:
+            edf = yf.Ticker(ticker).get_earnings_dates(limit=EARNINGS_DEEPER_LOOKBACK_LIMIT)
+        except Exception:
+            logger.warning("Deeper-lookback earnings fetch failed for %s", ticker, exc_info=True)
+            return None
+        if edf is None or edf.empty:
+            return None
+        for idx, row in edf.iterrows():
+            edate = idx.date() if hasattr(idx, "date") else idx
+            if edate == target_date:
+                reported_eps = row.get("Reported EPS")
+                if reported_eps is not None and _not_nan(reported_eps):
+                    return reported_eps, row.get("Surprise(%)")
+        return None
+
+    def _confirm_report_via_financials(self, ticker: str, target_date: date) -> bool:
+        """Last-resort independent cross-check: does yfinance's quarterly
+        income-statement table show a quarter ending near target_date has
+        already been posted? This carries no EPS-surprise number (only
+        get_earnings_dates() has that) -- it only confirms a report
+        genuinely happened, letting a synthesized earnings_surprise event
+        fall back to Tavily-scored sentiment instead of the numeric
+        surprise for its confidence/sentiment (score_sentiment never reads
+        surprise_pct directly; it's descriptive only).
+
+        Caveat, confirmed empirically (DELL, 2026-09-02): this table can
+        lag well behind an actual report -- DELL's most recent posted
+        quarter was still 2026-04-30 days after its 2026-09-01 earnings
+        date, so this check will often correctly return False even for a
+        report that has genuinely already happened. It's included as
+        requested, not because it's expected to be the primary recovery
+        path.
+        """
+        try:
+            stmt = yf.Ticker(ticker).quarterly_income_stmt
+        except Exception:
+            logger.warning("Quarterly financials lookup failed for %s", ticker, exc_info=True)
+            return False
+        if stmt is None or stmt.empty:
+            return False
+        for col in stmt.columns:
+            period_end = col.date() if hasattr(col, "date") else col
+            # Earnings typically follow quarter-end by days to a few weeks,
+            # so compare against a window around target_date rather than
+            # requiring an exact match.
+            if abs((period_end - target_date).days) <= 10:
+                return True
+        return False
 
     def _build_earnings_event(
         self, ticker: str, edate: date, event_type: str, surprise_pct, now: datetime

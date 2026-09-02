@@ -258,6 +258,7 @@ def test_disappearing_earnings_row_is_synthesized_from_calendar_with_warning(mon
             return {"Earnings Date": [today]} if self.ticker == "NVDA" else {}
 
     monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)  # skip real retry backoff
 
     detector = EventDetector(watchlist=["NVDA"], macro_events=[])
     monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
@@ -308,6 +309,7 @@ def test_get_earnings_dates_exception_still_reaches_stability_check(monkeypatch,
             return {"Earnings Date": [today]} if self.ticker == "CHWY" else {}
 
     monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)  # skip real retry backoff
 
     detector = EventDetector(watchlist=["CHWY"], macro_events=[])
     monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
@@ -352,6 +354,7 @@ def test_changing_earnings_date_between_polls_logs_warning(monkeypatch, caplog):
             return {}
 
     monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)  # skip real retry backoff
 
     detector = EventDetector(watchlist=["AVAV"], macro_events=[])
     monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
@@ -400,3 +403,145 @@ def test_stable_earnings_date_across_polls_logs_no_warning(monkeypatch, caplog):
         detector.check_earnings(now=now)
 
     assert not any("EARNINGS DATE INSTABILITY" in r.message for r in caplog.records)
+
+
+# -- earnings-date instability, round 2: same-cycle retry + deeper lookback -
+# Reproduced live 2026-09-02: get_earnings_dates() dropped rows for 6
+# tickers with real (sometimes large -- NIO +107%) earnings surprises.
+# PANW/MDT/MDB/NIO/GTLB recovered on their own within ~15-35 minutes;
+# DELL looked permanently gone (calendar had also rolled to a next-quarter
+# placeholder) but the row was recoverable via a differently-sized request.
+
+def test_same_cycle_retry_recovers_a_transient_miss(monkeypatch, caplog):
+    today = date(2026, 9, 1)
+    call_count = {"n": 0}
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            if self.ticker != "NIO":
+                return None
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _make_earnings_df(today)  # poll 1: upcoming, no EPS yet
+            if call_count["n"] in (2, 3):
+                return None  # poll 2 initial fetch + retry attempt 1: transiently missing
+            return _make_earnings_df(today, reported_eps=1.07)  # retry attempt 2: recovered
+
+        @property
+        def calendar(self):
+            return {}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)  # skip real retry backoff
+
+    detector = EventDetector(watchlist=["NIO"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    events_1 = detector.check_earnings(now=now)
+    assert events_1[0].event_type == "earnings_upcoming"
+
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        events_2 = detector.check_earnings(now=now)
+
+    # Recovered with the real reported EPS via retry -- not just a
+    # calendar-sourced earnings_upcoming fallback.
+    assert len(events_2) == 1
+    assert events_2[0].event_type == "earnings_surprise"
+    assert call_count["n"] == 4  # poll 1 (1 call) + poll 2 (initial + 2 retries)
+    assert any(
+        "recovered previously-active date" in r.message and "retry attempt 2/3" in r.message
+        for r in caplog.records
+    )
+    # A successful in-cycle recovery must not also raise a false-alarm
+    # instability warning -- the date never actually diverged from what
+    # was ultimately confirmed.
+    assert not any("EARNINGS DATE INSTABILITY" in r.message for r in caplog.records)
+
+
+def test_deeper_lookback_recovers_a_dell_style_permanent_looking_loss(monkeypatch, caplog):
+    today = date(2026, 9, 2)
+    prior_date = date(2026, 9, 1)  # reported yesterday -- still within lookback
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            if self.ticker != "DELL":
+                return None
+            if limit == ed_module.EARNINGS_DEEPER_LOOKBACK_LIMIT:
+                # Deeper/differently-sized request: the row is there, with
+                # real reported data, that the default-size request (and
+                # every same-cycle retry, which also uses the default) never sees.
+                return _make_earnings_df(prior_date, reported_eps=4.86)
+            return None  # default-size fetch, and every retry -- row missing
+
+        @property
+        def calendar(self):
+            # Calendar has also rolled forward to a next-quarter placeholder,
+            # well outside any eligibility window -- the DELL case exactly.
+            return {"Earnings Date": [date(2026, 11, 27)]}
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)
+
+    detector = EventDetector(watchlist=["DELL"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+    # Seed as if a prior poll had already seen the row before it vanished.
+    detector._last_earnings_date_seen["DELL"] = prior_date
+
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        events = detector.check_earnings(now=now)
+
+    assert len(events) == 1
+    assert events[0].event_type == "earnings_surprise"
+    assert prior_date.isoformat() in events[0].description
+    assert any(
+        "recovered earnings_surprise" in r.message and "deeper get_earnings_dates()" in r.message
+        for r in caplog.records
+    )
+
+
+def test_unrecoverable_report_logs_error_and_produces_no_event(monkeypatch, caplog):
+    # Everything fails: default fetch, retries, calendar, deep lookback,
+    # and the financials cross-check. Must degrade to a loud error and no
+    # fabricated event, not a silent drop or a guessed one.
+    today = date(2026, 9, 2)
+    prior_date = date(2026, 9, 1)
+
+    class FakeTicker:
+        def __init__(self, ticker):
+            self.ticker = ticker
+
+        def get_earnings_dates(self, limit=8):
+            return None if self.ticker == "DELL" else None
+
+        @property
+        def calendar(self):
+            return {"Earnings Date": [date(2026, 11, 27)]}
+
+        @property
+        def quarterly_income_stmt(self):
+            import pandas as pd
+            return pd.DataFrame({pd.Timestamp(date(2026, 4, 30)): [1.0]})
+
+    monkeypatch.setattr(ed_module.yf, "Ticker", FakeTicker)
+    monkeypatch.setattr(ed_module.time, "sleep", lambda *_: None)
+
+    detector = EventDetector(watchlist=["DELL"], macro_events=[])
+    monkeypatch.setattr(detector, "_search_news", lambda *a, **k: [])
+    detector._last_earnings_date_seen["DELL"] = prior_date
+
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+    with caplog.at_level("ERROR"):
+        events = detector.check_earnings(now=now)
+
+    assert events == []
+    assert any("appears unrecoverable this poll" in r.message for r in caplog.records)
